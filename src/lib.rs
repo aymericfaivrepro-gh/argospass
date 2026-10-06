@@ -90,7 +90,12 @@ fn ajout_puis_recherche() {
 #[test]
 fn ajout_refuse_un_titre_deja_present() {
     let mut vault = Vault::new();
-    assert!(vault.add(Entry::new("Gmail", "premier", "secret", "https://gmail.com")));
+    assert!(vault.add(Entry::new(
+        "Gmail",
+        "premier",
+        "secret",
+        "https://gmail.com"
+    )));
 
     assert!(!vault.add(Entry::new(
         "Gmail",
