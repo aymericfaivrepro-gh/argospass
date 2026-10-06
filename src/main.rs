@@ -1,6 +1,10 @@
 use argospass::{Entry, Vault};
 use clap::{Parser, Subcommand};
+use std::io;
+use std::path::Path;
 
+/// Emplacement du fichier coffre (dans le dossier courant pour l'instant).
+const VAULT_PATH: &str = "vault.json";
 /// ArgosPass : gestionnaire de mots de passe.
 #[derive(Parser)]
 #[command(version, about)]
@@ -36,9 +40,10 @@ enum Command {
     },
 }
 
-fn main() {
+fn main() -> io::Result<()> {
     let cli = Cli::parse();
-    let mut vault = Vault::new();
+    let path = Path::new(VAULT_PATH);
+    let mut vault = Vault::load(path)?;
 
     match cli.command {
         Command::Add {
@@ -47,12 +52,8 @@ fn main() {
             password,
             url,
         } => {
-            if vault.add(Entry::new(
-                &title,
-                &username,
-                &password,
-                &url.unwrap_or_default(),
-            )) {
+            if vault.add(Entry::new(&title, &username, &password, url.as_deref())) {
+                vault.save(path)?;
                 println!("Entrée « {title} » ajoutée");
             } else {
                 println!("Une entrée « {title} » existe déjà");
@@ -60,19 +61,33 @@ fn main() {
         }
         Command::List => {
             if vault.list().is_empty() {
-                println!("Le coffre est vide");
-            }
-            for entry in vault.list() {
-                println!("- {} ({})", entry.title, entry.username);
+                println!("Aucune entrée enregistrée.");
+            } else {
+                println!("Entrées :");
+                for entry in vault.list() {
+                    println!("- {} ({})", entry.title, entry.username);
+                }
             }
         }
         Command::Get { title } => match vault.get(&title) {
-            Some(entry) => println!("{} : {} / {}", entry.title, entry.username, entry.password),
+            Some(entry) => {
+                println!("Titre : {}", entry.title);
+                println!("Nom d'utilisateur : {}", entry.username);
+                println!("Mot de passe : {}", entry.password);
+                if let Some(url) = entry.url.as_deref().filter(|url| !url.is_empty()) {
+                    println!("URL : {url}");
+                }
+            }
             None => println!("Aucune entrée « {title} »"),
         },
         Command::Remove { title } => match vault.remove(&title) {
-            Some(_) => println!("Entrée « {title} » supprimée"),
+            Some(_) => {
+                vault.save(path)?;
+                println!("Entrée « {title} » supprimée");
+            }
             None => println!("Aucune entrée « {title} »"),
         },
     }
+
+    Ok(())
 }
