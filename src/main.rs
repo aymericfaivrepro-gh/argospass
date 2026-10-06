@@ -1,11 +1,30 @@
-use argospass::Entry;
+use argospass::{Entry, Vault};
 
 fn main() {
-    let entry = Entry::new(
+    let mut vault = Vault::new();
+    vault.add(Entry::new(
         "Gmail",
         "moi@gmail.com",
-        "mot-de-passe-de-test",
+        "test-1",
         "https://gmail.com",
-    );
-    println!("{} : {}", entry.title, entry.username);
+    ));
+    vault.add(Entry::new(
+        "GitHub",
+        "aymeric",
+        "test-2",
+        "https://gmail.com",
+    ));
+
+    println!("Entrées :");
+    for entry in vault.list() {
+        println!("- {} ({})", entry.title, entry.username);
+    }
+
+    match vault.get("GitHub") {
+        Some(entry) => println!("Mot de passe GitHub : {}", entry.password),
+        None => println!("Entrée introuvable"),
+    }
+
+    vault.remove("Gmail");
+    println!("{} entrée(s) restante(s)", vault.list().len());
 }
