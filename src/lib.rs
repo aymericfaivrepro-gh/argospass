@@ -33,8 +33,14 @@ impl Vault {
     }
 
     /// Ajoute une entrée au coffre.
-    pub fn add(&mut self, entry: Entry) {
+    /// Renvoie `false` si une entrée avec le même titre existe déjà.
+    pub fn add(&mut self, entry: Entry) -> bool {
+        if self.get(&entry.title).is_some() {
+            return false;
+        }
+
         self.entries.push(entry);
+        true
     }
 
     /// Cherche une entrée par son titre.
@@ -79,6 +85,21 @@ fn ajout_puis_recherche() {
 
     let entry = vault.get("Gmail").expect("l'entrée devrait exister");
     assert_eq!(entry.username, "moi@gmail.com");
+}
+
+#[test]
+fn ajout_refuse_un_titre_deja_present() {
+    let mut vault = Vault::new();
+    assert!(vault.add(Entry::new("Gmail", "premier", "secret", "https://gmail.com")));
+
+    assert!(!vault.add(Entry::new(
+        "Gmail",
+        "second",
+        "autre-secret",
+        "https://gmail.com",
+    )));
+    assert_eq!(vault.list().len(), 1);
+    assert_eq!(vault.get("Gmail").unwrap().username, "premier");
 }
 
 #[test]
