@@ -21,8 +21,6 @@ enum Command {
         title: String,
         /// Username or email address
         username: String,
-        /// Password
-        password: String,
         /// Service URL (optional)
         url: Option<String>,
     },
@@ -40,6 +38,18 @@ enum Command {
     },
 }
 
+fn prompt_confirmed_password() -> io::Result<Option<String>> {
+    let password = rpassword::prompt_password("Password: ")?;
+    let confirmation = rpassword::prompt_password("Confirm password: ")?;
+
+    if password != confirmation {
+        eprintln!("Passwords do not match; entry was not added.");
+        return Ok(None);
+    }
+
+    Ok(Some(password))
+}
+
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let path = Path::new(VAULT_PATH);
@@ -49,9 +59,12 @@ fn main() -> io::Result<()> {
         Command::Add {
             title,
             username,
-            password,
             url,
         } => {
+            let Some(password) = prompt_confirmed_password()? else {
+                return Ok(());
+            };
+
             if vault.add(Entry::new(&title, &username, &password, url.as_deref())) {
                 vault.save(path)?;
                 println!("Entry '{title}' added");
