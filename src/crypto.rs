@@ -23,7 +23,26 @@ const MEMORY_KIB: u32 = 64 * 1024;
 const ITERATIONS: u32 = 3;
 /// Degree of parallelism.
 const PARALLELISM: u32 = 4;
+/// Key material of an unlocked vault: the salt stored in the file
+/// and the key derived from the master password.
+pub struct VaultKey {
+    pub(crate) salt: [u8; SALT_LEN],
+    pub(crate) key: [u8; KEY_LEN],
+}
 
+impl VaultKey {
+    /// Creates key material for a new vault: generates a fresh salt and derives the key.
+    pub fn new(password: &str) -> io::Result<Self> {
+        let salt = generate_salt()?;
+        Self::from_salt(password, salt)
+    }
+
+    /// Re-derives the key of an existing vault from its stored salt.
+    pub fn from_salt(password: &str, salt: [u8; SALT_LEN]) -> io::Result<Self> {
+        let key = derive_key(password, &salt)?;
+        Ok(Self { salt, key })
+    }
+}
 /// Fills `buf` with random bytes from the operating system's CSPRNG.
 fn fill_random(buf: &mut [u8]) -> io::Result<()> {
     getrandom::fill(buf).map_err(|e| io::Error::other(e.to_string()))

@@ -1,5 +1,7 @@
 //! Password manager logic.
 pub mod crypto;
+
+use crypto::{SALT_LEN, VaultKey};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -64,21 +66,41 @@ impl Vault {
         let index = self.entries.iter().position(|e| e.title == title)?;
         Some(self.entries.remove(index))
     }
-    /// Loads the vault from a file.
-    /// Returns an empty vault if the file does not exist yet.
-    pub fn load(path: &Path) -> io::Result<Self> {
-        if !path.exists() {
-            return Ok(Self::new());
+    /// Opens and decrypts an existing vault file with the master password.
+    ///
+    /// Returns the vault and the key material needed to save it again.
+    /// Fails if the password is wrong or if the file has been modified.
+    pub fn open(path: &Path, password: &str) -> io::Result<(Self, VaultKey)> {
+        let data = fs::read(path)?;
+        if data.len() < SALT_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "vault file is too short",
+            ));
         }
-        let content = fs::read_to_string(path)?;
-        let vault = serde_json::from_str(&content)?;
-        Ok(vault)
+
+        let (salt, encrypted) = data.split_at(SALT_LEN);
+        let salt: [u8; SALT_LEN] = salt
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid salt"))?;
+
+        let key = VaultKey::from_salt(password, salt)?;
+        let plaintext = crypto::decrypt(&key.key, encrypted)?;
+        let vault = serde_json::from_slice(&plaintext)?;
+        Ok((vault, key))
     }
 
-    /// Saves the vault to a file.
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        let content = serde_json::to_string_pretty(self)?;
-        fs::write(path, content)
+    /// Encrypts and writes the vault to a file.
+    ///
+    /// File layout: `salt (16 bytes) || nonce (24 bytes) || ciphertext || tag (16 bytes)`.
+    pub fn save(&self, path: &Path, key: &VaultKey) -> io::Result<()> {
+        let plaintext = serde_json::to_vec(self)?;
+        let encrypted = crypto::encrypt(&key.key, &plaintext)?;
+
+        let mut data = Vec::with_capacity(SALT_LEN + encrypted.len());
+        data.extend_from_slice(&key.salt);
+        data.extend_from_slice(&encrypted);
+        fs::write(path, data)
     }
 }
 
@@ -156,24 +178,47 @@ mod tests {
         assert_eq!(removed.title, "Gmail");
         assert!(vault.list().is_empty());
     }
-
-    #[test]
-    fn saves_then_loads_vault() {
-        let path = std::env::temp_dir().join("argospass-test-vault.json");
+        #[test]
+    fn saves_then_opens_encrypted_vault() {
+        let path = std::env::temp_dir().join("argospass-test-roundtrip.argos");
+        let key = VaultKey::new("master").expect("key derivation should succeed");
 
         let mut vault = Vault::new();
-        assert!(vault.add(Entry::new(
-            "Gmail",
-            "moi@gmail.com",
-            "secret",
-            Some("https://gmail.com"),
-        )));
-        vault.save(&path).expect("saving should succeed");
+        assert!(vault.add(Entry::new("Gmail", "me@gmail.com", "secret", None)));
+        vault.save(&path, &key).expect("save should succeed");
 
-        let loaded = Vault::load(&path).expect("loading should succeed");
-        let entry = loaded.get("Gmail").expect("entry should exist");
-        assert_eq!(entry.username, "moi@gmail.com");
+        let (opened, _) = Vault::open(&path, "master").expect("open should succeed");
+        let entry = opened.get("Gmail").expect("entry should exist");
+        assert_eq!(entry.password, "secret");
 
-        std::fs::remove_file(&path).expect("cleanup should succeed");
+        fs::remove_file(&path).expect("cleanup should succeed");
     }
+
+    #[test]
+    fn wrong_master_password_fails_to_open() {
+        let path = std::env::temp_dir().join("argospass-test-wrong-password.argos");
+        let key = VaultKey::new("master").expect("key derivation should succeed");
+        Vault::new().save(&path, &key).expect("save should succeed");
+
+        assert!(Vault::open(&path, "not the master").is_err());
+
+        fs::remove_file(&path).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn saved_file_does_not_contain_plaintext() {
+        let path = std::env::temp_dir().join("argospass-test-no-plaintext.argos");
+        let key = VaultKey::new("master").expect("key derivation should succeed");
+
+        let mut vault = Vault::new();
+        assert!(vault.add(Entry::new("Gmail", "me@gmail.com", "secret", None)));
+        vault.save(&path, &key).expect("save should succeed");
+
+        let data = fs::read(&path).expect("read should succeed");
+        assert!(!data.windows(6).any(|w| w == b"secret"));
+        assert!(!data.windows(5).any(|w| w == b"Gmail"));
+
+        fs::remove_file(&path).expect("cleanup should succeed");
+    }
+    
 }
