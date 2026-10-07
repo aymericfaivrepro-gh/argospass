@@ -1,17 +1,19 @@
 use argospass::crypto::VaultKey;
 use argospass::{Entry, Vault};
 use clap::{Parser, Subcommand};
+use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-
-/// Location of the encrypted vault file (current directory for now).
-const VAULT_PATH: &str = "vault.argos";
 
 /// ArgosPass: a command-line password manager.
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
+    /// Path to the vault file [default: <user data dir>/argospass/vault.argos]
+    #[arg(long, global = true, env = "ARGOSPASS_VAULT")]
+    vault: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -55,12 +57,26 @@ fn main() -> ExitCode {
 
 fn run() -> io::Result<()> {
     let cli = Cli::parse();
-    let path = Path::new(VAULT_PATH);
+    let path = match cli.vault {
+        Some(path) => path,
+        None => default_vault_path()?,
+    };
 
     match cli.command {
-        Command::Init => init(path),
-        command => execute(path, command),
+        Command::Init => init(&path),
+        command => execute(&path, command),
     }
+}
+
+/// Returns the default vault location inside the user's data directory.
+fn default_vault_path() -> io::Result<PathBuf> {
+    let data_dir = dirs::data_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "cannot determine the user data directory",
+        )
+    })?;
+    Ok(data_dir.join("argospass").join("vault.argos"))
 }
 
 /// Creates a new vault protected by a new master password.
@@ -78,7 +94,9 @@ fn init(path: &Path) -> io::Result<()> {
             "passwords are empty or do not match",
         ));
     };
-
+    if let Some(parent) = path.parent() {
+        create_private_dir(parent)?;
+    }
     let key = VaultKey::new(&password)?;
     Vault::new().save(path, &key)?;
     println!("Vault created at {}", path.display());
@@ -90,7 +108,10 @@ fn execute(path: &Path, command: Command) -> io::Result<()> {
     if !path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "no vault found, run `argospass init` first",
+            format!(
+                "no vault found at {}, run `argospass init` first",
+                path.display()
+            ),
         ));
     }
 
@@ -159,4 +180,16 @@ fn ask_new_password(prompt: &str) -> io::Result<Option<String>> {
         return Ok(None);
     }
     Ok(Some(password))
+}
+/// Creates `dir` and its parents if needed.
+/// On Unix, newly created directories are restricted to the owner (`700`).
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
 }
