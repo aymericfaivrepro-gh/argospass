@@ -99,7 +99,11 @@ fn execute(path: &Path, command: Command) -> io::Result<()> {
 
     match command {
         Command::Init => unreachable!("init is handled in run()"),
-        Command::Add { title, username, url } => {
+        Command::Add {
+            title,
+            username,
+            url,
+        } => {
             let Some(password) = ask_new_password("Entry password: ")? else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,

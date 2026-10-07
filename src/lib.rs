@@ -5,7 +5,9 @@ use crypto::{SALT_LEN, VaultKey};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::Path;
+
 /// A vault entry: an account and its password.
 #[derive(Serialize, Deserialize)]
 pub struct Entry {
@@ -100,8 +102,37 @@ impl Vault {
         let mut data = Vec::with_capacity(SALT_LEN + encrypted.len());
         data.extend_from_slice(&key.salt);
         data.extend_from_slice(&encrypted);
-        fs::write(path, data)
+        write_atomic(path, &data)
     }
+}
+
+/// Writes `data` to `path` without ever leaving a partially written file.
+///
+/// The data is written to a temporary file, flushed to disk, then renamed over
+/// the destination. The previous version is kept as a `.bak` file.
+/// On Unix, the file is created with `600` permissions (owner read/write only).
+fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    let tmp_path = path.with_extension("argos.tmp");
+    let backup_path = path.with_extension("argos.bak");
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    {
+        let mut file = options.open(&tmp_path)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+    } // the file is closed here
+
+    if path.exists() {
+        fs::copy(path, &backup_path)?;
+    }
+    fs::rename(&tmp_path, path)
 }
 
 #[cfg(test)]
@@ -178,6 +209,4 @@ mod tests {
         assert_eq!(removed.title, "Gmail");
         assert!(vault.list().is_empty());
     }
-
-    
 }
