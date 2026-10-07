@@ -1,4 +1,5 @@
 //! Password manager logic.
+pub mod crypto;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
