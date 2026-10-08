@@ -1,5 +1,6 @@
 //! Password manager logic.
 pub mod crypto;
+pub mod generator;
 
 use crypto::{SALT_LEN, VaultKey};
 use serde::{Deserialize, Serialize};

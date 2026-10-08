@@ -44,7 +44,7 @@ impl VaultKey {
     }
 }
 /// Fills `buf` with random bytes from the operating system's CSPRNG.
-fn fill_random(buf: &mut [u8]) -> io::Result<()> {
+pub(crate) fn fill_random(buf: &mut [u8]) -> io::Result<()> {
     getrandom::fill(buf).map_err(|e| io::Error::other(e.to_string()))
 }
 

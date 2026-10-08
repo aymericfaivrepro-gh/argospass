@@ -1,4 +1,5 @@
 use argospass::crypto::VaultKey;
+use argospass::generator::{self, generate_password};
 use argospass::{Entry, Vault};
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -30,6 +31,18 @@ enum Command {
         username: String,
         /// Service URL (optional)
         url: Option<String>,
+        /// Generate a random password instead of typing one
+        #[arg(short, long)]
+        generate: bool,
+    },
+    /// Generate a random password (does not need the vault)
+    Generate {
+        /// Password length
+        #[arg(short, long, default_value_t = generator::DEFAULT_LENGTH)]
+        length: usize,
+        /// Use only letters and digits
+        #[arg(long)]
+        no_symbols: bool,
     },
     /// List entries
     List,
@@ -64,6 +77,10 @@ fn run() -> io::Result<()> {
 
     match cli.command {
         Command::Init => init(&path),
+        Command::Generate { length, no_symbols } => {
+            println!("{}", generate_password(length, !no_symbols)?);
+            Ok(())
+        }
         command => execute(&path, command),
     }
 }
@@ -119,22 +136,31 @@ fn execute(path: &Path, command: Command) -> io::Result<()> {
     let (mut vault, key) = Vault::open(path, &master_password)?;
 
     match command {
-        Command::Init => unreachable!("init is handled in run()"),
+        Command::Init | Command::Generate { .. } => unreachable!("handled in run()"),
         Command::Add {
             title,
             username,
             url,
+            generate,
         } => {
-            let Some(password) = ask_new_password("Entry password: ")? else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "passwords are empty or do not match",
-                ));
+            let password = if generate {
+                generate_password(generator::DEFAULT_LENGTH, true)?
+            } else {
+                let Some(password) = ask_new_password("Entry password: ")? else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "passwords are empty or do not match",
+                    ));
+                };
+                password
             };
 
             if vault.add(Entry::new(&title, &username, &password, url.as_deref())) {
                 vault.save(path, &key)?;
                 println!("Entry \"{title}\" added");
+                if generate {
+                    println!("Generated password: {password}");
+                }
             } else {
                 println!("An entry named \"{title}\" already exists");
             }
