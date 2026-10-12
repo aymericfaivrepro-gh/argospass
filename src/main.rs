@@ -2,6 +2,7 @@ use argospass::crypto::VaultKey;
 use argospass::generator::{self, generate_password};
 use argospass::{Entry, Vault};
 use clap::{Parser, Subcommand};
+use log::{LevelFilter, debug, info};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,10 @@ struct Cli {
     /// Path to the vault file [default: <user data dir>/argospass/vault.argos]
     #[arg(long, global = true, env = "ARGOSPASS_VAULT")]
     vault: Option<PathBuf>,
+
+    /// Explain what happens on stderr (-v: main steps, -vv: technical details)
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
 
     #[command(subcommand)]
     command: Command,
@@ -82,6 +87,8 @@ fn run() -> io::Result<()> {
         Some(path) => path,
         None => default_vault_path()?,
     };
+    init_logging(cli.verbose);
+    info!("vault path: {}", path.display());
 
     match cli.command {
         Command::Init => init(&path),
@@ -247,6 +254,7 @@ fn copy_temporarily(secret: &str) -> io::Result<()> {
     // On Linux, the clipboard content lives in this process: it must stay alive
     // until the user has pasted the password.
     // Pad the number so that "9 s" fully overwrites "10 s" on the same line.
+    debug!("waiting {CLIPBOARD_TIMEOUT_SECS} s so the password can be pasted");
     let width = CLIPBOARD_TIMEOUT_SECS.to_string().len();
     for remaining in (1..=CLIPBOARD_TIMEOUT_SECS).rev() {
         print!("\rPassword copied to the clipboard. Clearing in {remaining:>width$} s...");
@@ -256,6 +264,7 @@ fn copy_temporarily(secret: &str) -> io::Result<()> {
     println!();
 
     if clipboard.get_text().is_ok_and(|current| current == secret) {
+        debug!("clipboard still contains the password: overwriting it");
         // Overwrite rather than clear: more reliable across clipboard bridges such as WSLg.
         clipboard.set_text("").map_err(clipboard_error)?;
         println!("Clipboard cleared.");
@@ -266,4 +275,21 @@ fn copy_temporarily(secret: &str) -> io::Result<()> {
 /// Converts a clipboard error into an I/O error.
 fn clipboard_error(e: arboard::Error) -> io::Error {
     io::Error::other(format!("clipboard error: {e}"))
+}
+
+/// Configures logging on stderr according to the number of `-v` flags.
+fn init_logging(verbosity: u8) {
+    let level = match verbosity {
+        0 => LevelFilter::Warn,
+        1 => LevelFilter::Info,
+        _ => LevelFilter::Debug,
+    };
+
+    env_logger::Builder::new()
+        // Dependencies (clipboard, etc.) only show warnings...
+        .filter_level(LevelFilter::Warn)
+        // ...while our own crate follows the requested level.
+        .filter_module("argospass", level)
+        .format(|buf, record| writeln!(buf, "[{:<5}] {}", record.level(), record.args()))
+        .init();
 }

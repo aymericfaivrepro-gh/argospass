@@ -1,9 +1,12 @@
 //! Cryptography: deriving a key from the master password.
 
+use crate::to_hex;
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use log::{debug, info};
 use std::io;
+use std::time::Instant;
 
 /// Encryption key size: 32 bytes (256 bits).
 pub const KEY_LEN: usize = 32;
@@ -52,6 +55,7 @@ pub(crate) fn fill_random(buf: &mut [u8]) -> io::Result<()> {
 pub fn generate_salt() -> io::Result<[u8; SALT_LEN]> {
     let mut salt = [0u8; SALT_LEN];
     fill_random(&mut salt)?;
+    debug!("generated random salt: {}", to_hex(&salt));
     Ok(salt)
 }
 
@@ -68,7 +72,13 @@ pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> io::Result<Vec<u8>> {
     let ciphertext = cipher
         .encrypt(XNonce::from_slice(&nonce), plaintext)
         .map_err(|_| io::Error::other("encryption failed"))?;
-
+    debug!("generated random nonce: {}", to_hex(&nonce));
+    debug!(
+        "encrypted {} bytes -> {} bytes of ciphertext + tag (tag: {})",
+        plaintext.len(),
+        ciphertext.len(),
+        to_hex(&ciphertext[ciphertext.len() - TAG_LEN..])
+    );
     let mut output = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     output.extend_from_slice(&nonce);
     output.extend_from_slice(&ciphertext);
@@ -87,6 +97,12 @@ pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8]) -> io::Result<Vec<u8>> {
     }
 
     let (nonce, ciphertext) = data.split_at(NONCE_LEN);
+    debug!("nonce (from file): {}", to_hex(nonce));
+    debug!(
+        "verifying Poly1305 tag and decrypting {} bytes (tag: {})",
+        ciphertext.len(),
+        to_hex(&ciphertext[ciphertext.len() - TAG_LEN..])
+    );
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
 
     cipher
@@ -101,6 +117,14 @@ pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8]) -> io::Result<Vec<u8>> {
 
 /// Derives a 256-bit key from the master password and salt.
 pub fn derive_key(password: &str, salt: &[u8; SALT_LEN]) -> io::Result<[u8; KEY_LEN]> {
+    info!(
+        "deriving key with Argon2id ({} MiB, {} iterations, parallelism {})",
+        MEMORY_KIB / 1024,
+        ITERATIONS,
+        PARALLELISM
+    );
+    let start = Instant::now();
+
     let params = Params::new(MEMORY_KIB, ITERATIONS, PARALLELISM, Some(KEY_LEN))
         .map_err(|e| io::Error::other(e.to_string()))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -109,6 +133,9 @@ pub fn derive_key(password: &str, salt: &[u8; SALT_LEN]) -> io::Result<[u8; KEY_
     argon2
         .hash_password_into(password.as_bytes(), salt, &mut key)
         .map_err(|e| io::Error::other(e.to_string()))?;
+
+    info!("key derived in {:?}", start.elapsed());
+    // Never log `key` or `password`.
     Ok(key)
 }
 

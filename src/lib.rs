@@ -3,6 +3,7 @@ pub mod crypto;
 pub mod generator;
 
 use crypto::{SALT_LEN, VaultKey};
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -75,6 +76,8 @@ impl Vault {
     /// Fails if the password is wrong or if the file has been modified.
     pub fn open(path: &Path, password: &str) -> io::Result<(Self, VaultKey)> {
         let data = fs::read(path)?;
+        info!("opening vault");
+        debug!("read {} bytes from {}", data.len(), path.display());
         if data.len() < SALT_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -86,10 +89,12 @@ impl Vault {
         let salt: [u8; SALT_LEN] = salt
             .try_into()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid salt"))?;
+        debug!("salt (from file header): {}", to_hex(&salt));
 
         let key = VaultKey::from_salt(password, salt)?;
         let plaintext = crypto::decrypt(&key.key, encrypted)?;
-        let vault = serde_json::from_slice(&plaintext)?;
+        let vault: Vault = serde_json::from_slice(&plaintext)?;
+        info!("vault decrypted: {} entries", vault.entries.len());
         Ok((vault, key))
     }
 
@@ -97,7 +102,12 @@ impl Vault {
     ///
     /// File layout: `salt (16 bytes) || nonce (24 bytes) || ciphertext || tag (16 bytes)`.
     pub fn save(&self, path: &Path, key: &VaultKey) -> io::Result<()> {
+        info!("saving vault ({} entries)", self.entries.len());
         let plaintext = serde_json::to_vec(self)?;
+        debug!(
+            "serialized vault to {} bytes of JSON (not shown: it contains secrets)",
+            plaintext.len()
+        );
         let encrypted = crypto::encrypt(&key.key, &plaintext)?;
 
         let mut data = Vec::with_capacity(SALT_LEN + encrypted.len());
@@ -105,6 +115,13 @@ impl Vault {
         data.extend_from_slice(&encrypted);
         write_atomic(path, &data)
     }
+}
+
+/// Formats bytes as a lowercase hexadecimal string.
+///
+/// Only use it to log PUBLIC values (salt, nonce, tag), never secrets.
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Writes `data` to `path` without ever leaving a partially written file.
@@ -124,16 +141,25 @@ fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
         options.mode(0o600);
     }
 
+    debug!("writing temporary file {}", tmp_path.display());
     {
         let mut file = options.open(&tmp_path)?;
         file.write_all(data)?;
         file.sync_all()?;
     } // the file is closed here
+    debug!("data flushed to disk (fsync)");
 
     if path.exists() {
         fs::copy(path, &backup_path)?;
+        debug!("previous version backed up to {}", backup_path.display());
     }
-    fs::rename(&tmp_path, path)
+    fs::rename(&tmp_path, path)?;
+    debug!(
+        "atomically renamed {} -> {}",
+        tmp_path.display(),
+        path.display()
+    );
+    Ok(())
 }
 
 #[cfg(test)]

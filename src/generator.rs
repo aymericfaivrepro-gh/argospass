@@ -1,6 +1,7 @@
 //! Random password generator.
 
 use crate::crypto::fill_random;
+use log::debug;
 use std::io;
 
 /// Default length of generated passwords.
@@ -38,9 +39,15 @@ pub fn generate_password(length: usize, symbols: bool) -> io::Result<String> {
     let n = charset.len();
     // Largest multiple of `n` that fits in a byte: bytes at or above it are rejected.
     let limit = 256 - (256 % n);
+    debug!("charset: {n} characters, rejection limit: {limit} (bytes >= {limit} are discarded)");
+    debug!(
+        "entropy: {length} x log2({n}) = {:.1} bits",
+        length as f64 * (n as f64).log2()
+    );
 
     let mut password = String::with_capacity(length);
     let mut random_bytes = [0u8; 64];
+    let mut rejected = 0usize;
     while password.len() < length {
         fill_random(&mut random_bytes)?;
         for &byte in &random_bytes {
@@ -50,9 +57,12 @@ pub fn generate_password(length: usize, symbols: bool) -> io::Result<String> {
                 if password.len() == length {
                     break;
                 }
+            } else {
+                rejected += 1;
             }
         }
     }
+    debug!("{rejected} random bytes rejected to avoid modulo bias");
     Ok(password)
 }
 
