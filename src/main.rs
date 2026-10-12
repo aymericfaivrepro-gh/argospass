@@ -3,9 +3,14 @@ use argospass::generator::{self, generate_password};
 use argospass::{Entry, Vault};
 use clap::{Parser, Subcommand};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
+
+/// How long a copied password stays in the clipboard, in seconds.
+const CLIPBOARD_TIMEOUT_SECS: u64 = 20;
 
 /// ArgosPass: a command-line password manager.
 #[derive(Parser)]
@@ -46,10 +51,13 @@ enum Command {
     },
     /// List entries
     List,
-    /// Show an entry
+    /// Show an entry and copy its password to the clipboard
     Get {
         /// Entry title
         title: String,
+        /// Print the password instead of copying it
+        #[arg(long)]
+        show: bool,
     },
     /// Remove an entry
     Remove {
@@ -159,7 +167,7 @@ fn execute(path: &Path, command: Command) -> io::Result<()> {
                 vault.save(path, &key)?;
                 println!("Entry \"{title}\" added");
                 if generate {
-                    println!("Generated password: {password}");
+                    copy_temporarily(&password)?;
                 }
             } else {
                 println!("An entry named \"{title}\" already exists");
@@ -173,13 +181,17 @@ fn execute(path: &Path, command: Command) -> io::Result<()> {
                 println!("- {} ({})", entry.title, entry.username);
             }
         }
-        Command::Get { title } => match vault.get(&title) {
+        Command::Get { title, show } => match vault.get(&title) {
             Some(entry) => {
                 println!("Title: {}", entry.title);
                 println!("Username: {}", entry.username);
-                println!("Password: {}", entry.password);
                 if let Some(url) = entry.url.as_deref().filter(|url| !url.is_empty()) {
                     println!("URL: {url}");
+                }
+                if show {
+                    println!("Password: {}", entry.password);
+                } else {
+                    copy_temporarily(&entry.password)?;
                 }
             }
             None => println!("No entry named \"{title}\""),
@@ -218,4 +230,40 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
         builder.mode(0o700);
     }
     builder.create(dir)
+}
+
+/// Copies `secret` to the clipboard, waits, then clears it.
+///
+/// The clipboard is only cleared if it still contains `secret`,
+/// so that anything copied by the user in the meantime is preserved.
+fn copy_temporarily(secret: &str) -> io::Result<()> {
+    let mut clipboard = arboard::Clipboard::new().map_err(clipboard_error)?;
+    clipboard.set_text(secret).map_err(clipboard_error)?;
+
+    eprintln!(
+        "Warning: if you interrupt this command (Ctrl+C) or a clipboard history is enabled, \
+         the password may remain in memory."
+    );
+    // On Linux, the clipboard content lives in this process: it must stay alive
+    // until the user has pasted the password.
+    // Pad the number so that "9 s" fully overwrites "10 s" on the same line.
+    let width = CLIPBOARD_TIMEOUT_SECS.to_string().len();
+    for remaining in (1..=CLIPBOARD_TIMEOUT_SECS).rev() {
+        print!("\rPassword copied to the clipboard. Clearing in {remaining:>width$} s...");
+        io::stdout().flush()?;
+        thread::sleep(Duration::from_secs(1));
+    }
+    println!();
+
+    if clipboard.get_text().is_ok_and(|current| current == secret) {
+        // Overwrite rather than clear: more reliable across clipboard bridges such as WSLg.
+        clipboard.set_text("").map_err(clipboard_error)?;
+        println!("Clipboard cleared.");
+    }
+    Ok(())
+}
+
+/// Converts a clipboard error into an I/O error.
+fn clipboard_error(e: arboard::Error) -> io::Error {
+    io::Error::other(format!("clipboard error: {e}"))
 }
