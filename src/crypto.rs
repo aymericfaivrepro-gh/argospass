@@ -1,12 +1,11 @@
 //! Cryptography: deriving a key from the master password.
 
 use crate::format::Header;
-use crate::to_hex;
+use crate::{Error, Result, to_hex};
 use argon2::{Algorithm, Argon2, Block, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use log::{debug, info};
-use std::io;
 use std::time::Instant;
 use zeroize::Zeroizing;
 
@@ -65,7 +64,7 @@ impl KdfParams {
     };
 
     /// Checks that the parameters are within the accepted bounds.
-    pub fn validate(&self) -> io::Result<()> {
+    pub fn validate(&self) -> Result<()> {
         let (min, max) = (Self::MINIMUM, Self::MAXIMUM);
         let valid = (min.memory_kib..=max.memory_kib).contains(&self.memory_kib)
             && (min.iterations..=max.iterations).contains(&self.iterations)
@@ -74,10 +73,7 @@ impl KdfParams {
         if valid {
             Ok(())
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported Argon2id parameters: {self:?}"),
-            ))
+            Err(Error::UnsupportedKdfParams(*self))
         }
     }
 }
@@ -93,7 +89,7 @@ pub struct VaultKey {
 
 impl VaultKey {
     /// Creates key material for a new vault: fresh salt, default parameters.
-    pub fn new(password: &str) -> io::Result<Self> {
+    pub fn new(password: &str) -> Result<Self> {
         let header = Header {
             params: KdfParams::DEFAULT,
             salt: generate_salt()?,
@@ -102,20 +98,15 @@ impl VaultKey {
     }
 
     /// Re-derives the key of an existing vault from its header.
-    pub fn from_header(password: &str, header: Header) -> io::Result<Self> {
+    pub fn from_header(password: &str, header: Header) -> Result<Self> {
         let key = derive_key(password, &header.salt, &header.params)?;
         Ok(Self { header, key })
     }
 }
-/// Fills `buf` with random bytes from the operating system's CSPRNG.
-pub(crate) fn fill_random(buf: &mut [u8]) -> io::Result<()> {
-    getrandom::fill(buf).map_err(|e| io::Error::other(e.to_string()))
-}
-
 /// Generates a random salt using the operating system's CSPRNG.
-pub fn generate_salt() -> io::Result<[u8; SALT_LEN]> {
+pub fn generate_salt() -> Result<[u8; SALT_LEN]> {
     let mut salt = [0u8; SALT_LEN];
-    fill_random(&mut salt)?;
+    getrandom::fill(&mut salt)?;
     debug!("generated random salt: {}", to_hex(&salt));
     Ok(salt)
 }
@@ -124,11 +115,11 @@ pub fn generate_salt() -> io::Result<[u8; SALT_LEN]> {
 ///
 /// A fresh random nonce is generated on every call.
 /// Output layout: `nonce (24 bytes) || ciphertext || tag (16 bytes)`.
-pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> io::Result<Vec<u8>> {
+pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
 
     let mut nonce = [0u8; NONCE_LEN];
-    fill_random(&mut nonce)?;
+    getrandom::fill(&mut nonce)?;
 
     let ciphertext = cipher
         .encrypt(
@@ -138,7 +129,7 @@ pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> io::Result<
                 aad,
             },
         )
-        .map_err(|_| io::Error::other("encryption failed"))?;
+        .map_err(|_| Error::EncryptionFailed)?;
     debug!("generated random nonce: {}", to_hex(&nonce));
     debug!(
         "encrypted {} bytes -> {} bytes of ciphertext + tag (tag: {})",
@@ -154,13 +145,11 @@ pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> io::Result<
 
 /// Decrypts data produced by [`encrypt`].
 ///
-/// Fails if the key is wrong or if the data has been modified.
-pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8], aad: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
+/// Fails with [`Error::DecryptionFailed`] if the key is wrong or if the data
+/// (or the associated data) has been modified.
+pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if data.len() < NONCE_LEN + TAG_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "encrypted data is too short",
-        ));
+        return Err(Error::Truncated);
     }
 
     let (nonce, ciphertext) = data.split_at(NONCE_LEN);
@@ -181,12 +170,7 @@ pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8], aad: &[u8]) -> io::Result<Zeroi
             },
         )
         .map(Zeroizing::new)
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "decryption failed: wrong password or corrupted data",
-            )
-        })
+        .map_err(|_| Error::DecryptionFailed)
 }
 
 /// Derives a 256-bit key from the master password and salt.
@@ -194,7 +178,7 @@ pub fn derive_key(
     password: &str,
     salt: &[u8; SALT_LEN],
     params: &KdfParams,
-) -> io::Result<Box<Zeroizing<[u8; KEY_LEN]>>> {
+) -> Result<Box<Zeroizing<[u8; KEY_LEN]>>> {
     info!(
         "deriving key with Argon2id ({} MiB, {} iterations, parallelism {})",
         params.memory_kib / 1024,
@@ -208,17 +192,14 @@ pub fn derive_key(
         params.iterations,
         params.parallelism,
         Some(KEY_LEN),
-    )
-    .map_err(|e| io::Error::other(e.to_string()))?;
+    )?;
 
     // Argon2's working memory is derived from the password and is enough to
     // recompute the key: provide it ourselves so that it is wiped afterwards.
     let mut memory = Zeroizing::new(vec![Block::default(); argon2_params.block_count()]);
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon2_params);
     let mut key = Box::new(Zeroizing::new([0u8; KEY_LEN]));
-    argon2
-        .hash_password_into_with_memory(password.as_bytes(), salt, &mut **key, &mut *memory)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    argon2.hash_password_into_with_memory(password.as_bytes(), salt, &mut **key, &mut *memory)?;
 
     info!("key derived in {:?}", start.elapsed());
     Ok(key)
@@ -287,7 +268,10 @@ mod tests {
     fn wrong_key_fails_to_decrypt() {
         let encrypted =
             encrypt(&[1u8; KEY_LEN], b"hello vault", &[]).expect("encryption should succeed");
-        assert!(decrypt(&[2u8; KEY_LEN], &encrypted, &[]).is_err());
+        assert!(matches!(
+            decrypt(&[2u8; KEY_LEN], &encrypted, &[]),
+            Err(Error::DecryptionFailed)
+        ));
     }
 
     #[test]
@@ -296,13 +280,19 @@ mod tests {
         let mut encrypted = encrypt(&key, b"hello vault", &[]).expect("encryption should succeed");
         let last = encrypted.len() - 1;
         encrypted[last] ^= 0x01; // flip one bit
-        assert!(decrypt(&key, &encrypted, &[]).is_err());
+        assert!(matches!(
+            decrypt(&key, &encrypted, &[]),
+            Err(Error::DecryptionFailed)
+        ));
     }
 
     #[test]
     fn too_short_data_fails_to_decrypt() {
         let key = [42u8; KEY_LEN];
-        assert!(decrypt(&key, &[0u8; 10], &[]).is_err());
+        assert!(matches!(
+            decrypt(&key, &[0u8; 10], &[]),
+            Err(Error::Truncated)
+        ));
     }
 
     #[test]
@@ -332,6 +322,21 @@ mod tests {
     }
 
     #[test]
+    fn out_of_bounds_params_are_rejected() {
+        assert!(KdfParams::DEFAULT.validate().is_ok());
+        assert!(KdfParams::LEGACY.validate().is_ok());
+
+        let too_weak = KdfParams {
+            iterations: 1,
+            ..KdfParams::DEFAULT
+        };
+        assert!(matches!(
+            too_weak.validate(),
+            Err(Error::UnsupportedKdfParams(params)) if params == too_weak
+        ));
+    }
+
+    #[test]
     fn zeroize_wipes_key_bytes() {
         use zeroize::Zeroize;
 
@@ -345,6 +350,9 @@ mod tests {
         let key = [42u8; KEY_LEN];
         let encrypted = encrypt(&key, b"hello vault", b"header v1").expect("encryption");
         assert!(decrypt(&key, &encrypted, b"header v1").is_ok());
-        assert!(decrypt(&key, &encrypted, b"header v2").is_err());
+        assert!(matches!(
+            decrypt(&key, &encrypted, b"header v2"),
+            Err(Error::DecryptionFailed)
+        ));
     }
 }

@@ -14,7 +14,7 @@
 //! associated data (AAD) to XChaCha20-Poly1305.
 
 use crate::crypto::{KdfParams, SALT_LEN};
-use std::io;
+use crate::{Error, Result};
 
 /// Identifies an ArgosPass vault file.
 pub const MAGIC: &[u8; 5] = b"ARGOS";
@@ -60,19 +60,17 @@ impl Header {
     ///
     /// The values are NOT authenticated yet: they are only checked for sanity
     /// here, and authenticated later by the Poly1305 tag.
-    pub fn from_bytes(data: &[u8]) -> io::Result<Self> {
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < HEADER_LEN {
-            return Err(invalid_data("file is too short to be an ArgosPass vault"));
+            return Err(Error::Truncated);
         }
         if !data.starts_with(MAGIC) {
-            return Err(invalid_data("not an ArgosPass vault (bad magic number)"));
+            return Err(Error::BadMagic);
         }
 
         let version = data[VERSION_OFFSET];
         if version != FORMAT_VERSION {
-            return Err(invalid_data(&format!(
-                "unsupported vault format version {version}"
-            )));
+            return Err(Error::UnsupportedVersion(version));
         }
 
         let params = KdfParams {
@@ -96,10 +94,6 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
         .try_into()
         .expect("length checked by the caller");
     u32::from_le_bytes(bytes)
-}
-
-fn invalid_data(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
 
 #[cfg(test)]
@@ -131,20 +125,26 @@ mod tests {
     fn rejects_bad_magic() {
         let mut bytes = sample_header().to_bytes();
         bytes[0] = b'X';
-        assert!(Header::from_bytes(&bytes).is_err());
+        assert!(matches!(Header::from_bytes(&bytes), Err(Error::BadMagic)));
     }
 
     #[test]
     fn rejects_unknown_version() {
         let mut bytes = sample_header().to_bytes();
         bytes[VERSION_OFFSET] = 99;
-        assert!(Header::from_bytes(&bytes).is_err());
+        assert!(matches!(
+            Header::from_bytes(&bytes),
+            Err(Error::UnsupportedVersion(99))
+        ));
     }
 
     #[test]
     fn rejects_too_short_data() {
         let bytes = sample_header().to_bytes();
-        assert!(Header::from_bytes(&bytes[..HEADER_LEN - 1]).is_err());
+        assert!(matches!(
+            Header::from_bytes(&bytes[..HEADER_LEN - 1]),
+            Err(Error::Truncated)
+        ));
     }
 
     #[test]
@@ -157,7 +157,10 @@ mod tests {
                 },
                 ..sample_header()
             };
-            assert!(Header::from_bytes(&header.to_bytes()).is_err());
+            assert!(matches!(
+                Header::from_bytes(&header.to_bytes()),
+                Err(Error::UnsupportedKdfParams(params)) if params == header.params
+            ));
         }
     }
 }

@@ -125,6 +125,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "thiserror",
  "zeroize",
 ]
 

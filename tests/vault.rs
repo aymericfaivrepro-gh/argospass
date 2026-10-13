@@ -2,9 +2,10 @@
 
 use argospass::crypto::VaultKey;
 use argospass::crypto::{KdfParams, SALT_LEN, derive_key, encrypt};
-use argospass::format::MAGIC;
-use argospass::{Entry, Vault};
+use argospass::format::{HEADER_LEN, MAGIC};
+use argospass::{Entry, Error, Vault};
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 
 /// Returns a path in the system temp directory, unique to each test.
@@ -18,7 +19,9 @@ fn saves_then_opens_encrypted_vault() {
     let key = VaultKey::new("master").expect("key derivation should succeed");
 
     let mut vault = Vault::new();
-    assert!(vault.add(Entry::new("Gmail", "me@gmail.com", "secret", None)));
+    vault
+        .add(Entry::new("Gmail", "me@gmail.com", "secret", None))
+        .expect("add should succeed");
     vault.save(&path, &key).expect("save should succeed");
 
     let (opened, _) = Vault::open(&path, "master").expect("open should succeed");
@@ -34,7 +37,10 @@ fn wrong_master_password_fails_to_open() {
     let key = VaultKey::new("master").expect("key derivation should succeed");
     Vault::new().save(&path, &key).expect("save should succeed");
 
-    assert!(Vault::open(&path, "not the master").is_err());
+    assert!(matches!(
+        Vault::open(&path, "not the master"),
+        Err(Error::DecryptionFailed)
+    ));
 
     fs::remove_file(&path).expect("cleanup should succeed");
 }
@@ -45,7 +51,9 @@ fn saved_file_does_not_contain_plaintext() {
     let key = VaultKey::new("master").expect("key derivation should succeed");
 
     let mut vault = Vault::new();
-    assert!(vault.add(Entry::new("Gmail", "me@gmail.com", "secret", None)));
+    vault
+        .add(Entry::new("Gmail", "me@gmail.com", "secret", None))
+        .expect("add should succeed");
     vault.save(&path, &key).expect("save should succeed");
 
     let data = fs::read(&path).expect("read should succeed");
@@ -61,10 +69,14 @@ fn second_save_keeps_previous_version_as_backup() {
     let key = VaultKey::new("master").expect("key derivation should succeed");
 
     let mut vault = Vault::new();
-    assert!(vault.add(Entry::new("First", "me", "one", None)));
+    vault
+        .add(Entry::new("First", "me", "one", None))
+        .expect("add should succeed");
     vault.save(&path, &key).expect("first save should succeed");
 
-    assert!(vault.add(Entry::new("Second", "me", "two", None)));
+    vault
+        .add(Entry::new("Second", "me", "two", None))
+        .expect("add should succeed");
     vault.save(&path, &key).expect("second save should succeed");
 
     let (current, _) = Vault::open(&path, "master").expect("open should succeed");
@@ -113,9 +125,67 @@ fn tampered_header_fails_to_open() {
     data[10] = 4; // iterations: 3 -> 4 (still within the accepted bounds)
     fs::write(&path, &data).expect("write should succeed");
 
-    assert!(Vault::open(&path, "master").is_err());
+    // The header is authenticated: changing it is detected like a wrong password.
+    assert!(matches!(
+        Vault::open(&path, "master"),
+        Err(Error::DecryptionFailed)
+    ));
 
     fs::remove_file(&path).expect("cleanup should succeed");
+}
+
+#[test]
+fn excessive_kdf_params_are_rejected_before_key_derivation() {
+    let path = temp_vault("excessive-params");
+    let key = VaultKey::new("master").expect("key derivation should succeed");
+    Vault::new().save(&path, &key).expect("save should succeed");
+
+    let mut data = fs::read(&path).expect("read should succeed");
+    data[6..10].copy_from_slice(&u32::MAX.to_le_bytes()); // memory cost: 4 TiB
+    fs::write(&path, &data).expect("write should succeed");
+
+    // Rejected from the header alone: Argon2id never tries to allocate 4 TiB.
+    assert!(matches!(
+        Vault::open(&path, "master"),
+        Err(Error::UnsupportedKdfParams(params)) if params.memory_kib == u32::MAX
+    ));
+
+    fs::remove_file(&path).expect("cleanup should succeed");
+}
+
+#[test]
+fn truncated_vault_fails_to_open() {
+    let path = temp_vault("truncated");
+    let key = VaultKey::new("master").expect("key derivation should succeed");
+    Vault::new().save(&path, &key).expect("save should succeed");
+    let data = fs::read(&path).expect("read should succeed");
+
+    // Cut in the middle of the header...
+    fs::write(&path, &data[..10]).expect("write should succeed");
+    assert!(matches!(
+        Vault::open(&path, "master"),
+        Err(Error::Truncated)
+    ));
+
+    // ...or right after it, leaving no room for the nonce and the tag.
+    fs::write(&path, &data[..HEADER_LEN]).expect("write should succeed");
+    assert!(matches!(
+        Vault::open(&path, "master"),
+        Err(Error::Truncated)
+    ));
+
+    fs::remove_file(&path).expect("cleanup should succeed");
+}
+
+#[test]
+fn missing_vault_is_an_io_error() {
+    let path = temp_vault("missing");
+    assert!(!path.exists());
+
+    assert!(matches!(
+        Vault::open(&path, "master"),
+        Err(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound
+    ));
 }
 
 #[test]

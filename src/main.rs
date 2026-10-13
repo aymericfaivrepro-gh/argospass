@@ -1,22 +1,50 @@
 use argospass::crypto::VaultKey;
 use argospass::generator::{self, generate_password};
-use argospass::{Entry, Vault};
+use argospass::{Entry, Error, Vault};
 use clap::{Parser, Subcommand};
 use log::{LevelFilter, debug, info};
 use std::fs;
 use std::io::{self, Write};
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
+/// Any error: from the library (`argospass::Error`) or from the application.
+type AppResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
 /// How long a copied password stays in the clipboard, in seconds.
 const CLIPBOARD_TIMEOUT_SECS: u64 = 20;
 
+/// Number of master password attempts before giving up.
+const MAX_PASSWORD_ATTEMPTS: u32 = 3;
+
+// Exit codes, so that scripts can tell failures apart.
+const EXIT_FAILURE: u8 = 1;
+/// Also returned by clap itself for invalid arguments.
+const EXIT_USAGE: u8 = 2;
+const EXIT_DECRYPTION_FAILED: u8 = 3;
+const EXIT_INVALID_VAULT: u8 = 4;
+const EXIT_IO: u8 = 5;
+const EXIT_ENTRY_NOT_FOUND: u8 = 6;
+const EXIT_ENTRY_EXISTS: u8 = 7;
+
+const EXIT_STATUS_HELP: &str = "\
+Exit status:
+  0  success
+  1  other error
+  2  invalid command-line usage
+  3  wrong master password, or corrupted vault
+  4  invalid or unsupported vault file
+  5  input/output error
+  6  no entry with this title
+  7  an entry with this title already exists";
+
 /// ArgosPass: a command-line password manager.
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about, after_help = EXIT_STATUS_HELP)]
 struct Cli {
     /// Path to the vault file [default: <user data dir>/argospass/vault.argos]
     #[arg(long, global = true, env = "ARGOSPASS_VAULT")]
@@ -75,14 +103,48 @@ enum Command {
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            ExitCode::FAILURE
+        Err(error) => {
+            report(&*error);
+            ExitCode::from(exit_code(&*error))
         }
     }
 }
 
-fn run() -> io::Result<()> {
+/// Prints `error` on stderr, followed by the errors that caused it.
+fn report(error: &dyn std::error::Error) {
+    eprint!("Error: {error}");
+    for cause in iter::successors(error.source(), |e| e.source()) {
+        eprint!(": {cause}");
+    }
+    eprintln!();
+}
+
+/// Chooses the exit code according to what failed.
+fn exit_code(error: &(dyn std::error::Error + 'static)) -> u8 {
+    if let Some(error) = error.downcast_ref::<Error>() {
+        // No `_` arm: a new variant must be given an exit code.
+        return match error {
+            Error::DecryptionFailed => EXIT_DECRYPTION_FAILED,
+            Error::Truncated
+            | Error::BadMagic
+            | Error::UnsupportedVersion(_)
+            | Error::UnsupportedKdfParams(_)
+            | Error::Json(_) => EXIT_INVALID_VAULT,
+            Error::Io(_) => EXIT_IO,
+            Error::PasswordTooShort { .. } => EXIT_USAGE,
+            Error::EntryNotFound(_) => EXIT_ENTRY_NOT_FOUND,
+            Error::EntryAlreadyExists(_) => EXIT_ENTRY_EXISTS,
+            Error::EncryptionFailed | Error::KeyDerivation(_) | Error::Random(_) => EXIT_FAILURE,
+        };
+    }
+    if error.is::<io::Error>() {
+        EXIT_IO
+    } else {
+        EXIT_FAILURE
+    }
+}
+
+fn run() -> AppResult {
     let cli = Cli::parse();
     let path = match cli.vault {
         Some(path) => path,
@@ -102,31 +164,18 @@ fn run() -> io::Result<()> {
 }
 
 /// Returns the default vault location inside the user's data directory.
-fn default_vault_path() -> io::Result<PathBuf> {
-    let data_dir = dirs::data_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "cannot determine the user data directory",
-        )
-    })?;
+fn default_vault_path() -> AppResult<PathBuf> {
+    let data_dir = dirs::data_dir().ok_or("cannot determine the user data directory")?;
     Ok(data_dir.join("argospass").join("vault.argos"))
 }
 
 /// Creates a new vault protected by a new master password.
-fn init(path: &Path) -> io::Result<()> {
+fn init(path: &Path) -> AppResult {
     if path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "a vault already exists",
-        ));
+        return Err("a vault already exists".into());
     }
 
-    let Some(password) = ask_new_password("New master password: ")? else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "passwords are empty or do not match",
-        ));
-    };
+    let password = ask_new_password("New master password: ")?;
     if let Some(parent) = path.parent() {
         create_private_dir(parent)?;
     }
@@ -137,21 +186,16 @@ fn init(path: &Path) -> io::Result<()> {
 }
 
 /// Unlocks the vault with the master password, then runs the command.
-fn execute(path: &Path, command: Command) -> io::Result<()> {
+fn execute(path: &Path, command: Command) -> AppResult {
     if !path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "no vault found at {}, run `argospass init` first",
-                path.display()
-            ),
-        ));
+        let message = format!(
+            "no vault found at {}, run `argospass init` first",
+            path.display()
+        );
+        return Err(message.into());
     }
 
-    let (mut vault, key) = {
-        let master_password = Zeroizing::new(rpassword::prompt_password("Master password: ")?);
-        Vault::open(path, &master_password)?
-    };
+    let (mut vault, key) = unlock(path)?;
 
     match command {
         Command::Init | Command::Generate { .. } => unreachable!("handled in run()"),
@@ -164,23 +208,14 @@ fn execute(path: &Path, command: Command) -> io::Result<()> {
             let password = if generate {
                 generate_password(generator::DEFAULT_LENGTH, true)?
             } else {
-                let Some(password) = ask_new_password("Entry password: ")? else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "passwords are empty or do not match",
-                    ));
-                };
-                password
+                ask_new_password("Entry password: ")?
             };
 
-            if vault.add(Entry::new(&title, &username, &password, url.as_deref())) {
-                vault.save(path, &key)?;
-                println!("Entry \"{title}\" added");
-                if generate {
-                    copy_temporarily(&password)?;
-                }
-            } else {
-                println!("An entry named \"{title}\" already exists");
+            vault.add(Entry::new(&title, &username, &password, url.as_deref()))?;
+            vault.save(path, &key)?;
+            println!("Entry \"{title}\" added");
+            if generate {
+                copy_temporarily(&password)?;
             }
         }
         Command::List => {
@@ -191,43 +226,59 @@ fn execute(path: &Path, command: Command) -> io::Result<()> {
                 println!("- {} ({})", entry.title, entry.username);
             }
         }
-        Command::Get { title, show } => match vault.get(&title) {
-            Some(entry) => {
-                println!("Title: {}", entry.title);
-                println!("Username: {}", entry.username);
-                if let Some(url) = entry.url.as_deref().filter(|url| !url.is_empty()) {
-                    println!("URL: {url}");
-                }
-                if show {
-                    println!("Password: {}", entry.password);
-                } else {
-                    copy_temporarily(&entry.password)?;
-                }
+        Command::Get { title, show } => {
+            let entry = vault.get(&title)?;
+            println!("Title: {}", entry.title);
+            println!("Username: {}", entry.username);
+            if let Some(url) = entry.url.as_deref().filter(|url| !url.is_empty()) {
+                println!("URL: {url}");
             }
-            None => println!("No entry named \"{title}\""),
-        },
-        Command::Remove { title } => match vault.remove(&title) {
-            Some(_) => {
-                vault.save(path, &key)?;
-                println!("Entry \"{title}\" removed");
+            if show {
+                println!("Password: {}", entry.password);
+            } else {
+                copy_temporarily(&entry.password)?;
             }
-            None => println!("No entry named \"{title}\""),
-        },
+        }
+        Command::Remove { title } => {
+            vault.remove(&title)?;
+            vault.save(path, &key)?;
+            println!("Entry \"{title}\" removed");
+        }
     }
 
     Ok(())
 }
 
+/// Prompts for the master password and opens the vault.
+/// After a wrong password, asks again, up to `MAX_PASSWORD_ATTEMPTS` times.
+fn unlock(path: &Path) -> AppResult<(Vault, VaultKey)> {
+    let mut attempts_left = MAX_PASSWORD_ATTEMPTS;
+    loop {
+        let master_password = Zeroizing::new(rpassword::prompt_password("Master password: ")?);
+        match Vault::open(path, &master_password) {
+            Err(Error::DecryptionFailed) if attempts_left > 1 => {
+                attempts_left -= 1;
+                let plural = if attempts_left == 1 { "" } else { "s" };
+                eprintln!(
+                    "Wrong master password (or corrupted vault): \
+                     {attempts_left} attempt{plural} left."
+                );
+            }
+            result => return Ok(result?),
+        }
+    }
+}
+
 /// Prompts twice for a new password with hidden input.
-/// Returns `None` if the password is empty or the two inputs differ.
-fn ask_new_password(prompt: &str) -> io::Result<Option<Zeroizing<String>>> {
+/// Fails if the password is empty or the two inputs differ.
+fn ask_new_password(prompt: &str) -> AppResult<Zeroizing<String>> {
     let password = Zeroizing::new(rpassword::prompt_password(prompt)?);
     let confirmation = Zeroizing::new(rpassword::prompt_password("Confirm: ")?);
 
     if password.is_empty() || *password != *confirmation {
-        return Ok(None);
+        return Err("passwords are empty or do not match".into());
     }
-    Ok(Some(password))
+    Ok(password)
 }
 /// Creates `dir` and its parents if needed.
 /// On Unix, newly created directories are restricted to the owner (`700`).
@@ -246,9 +297,9 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
 ///
 /// The clipboard is only cleared if it still contains `secret`,
 /// so that anything copied by the user in the meantime is preserved.
-fn copy_temporarily(secret: &str) -> io::Result<()> {
-    let mut clipboard = arboard::Clipboard::new().map_err(clipboard_error)?;
-    clipboard.set_text(secret).map_err(clipboard_error)?;
+fn copy_temporarily(secret: &str) -> AppResult {
+    let mut clipboard = arboard::Clipboard::new()?;
+    clipboard.set_text(secret)?;
 
     eprintln!(
         "Warning: if you interrupt this command (Ctrl+C) or a clipboard history is enabled, \
@@ -273,15 +324,10 @@ fn copy_temporarily(secret: &str) -> io::Result<()> {
     if still_ours {
         debug!("clipboard still contains the password: overwriting it");
         // Overwrite rather than clear: more reliable across clipboard bridges such as WSLg.
-        clipboard.set_text("").map_err(clipboard_error)?;
+        clipboard.set_text("")?;
         println!("Clipboard cleared.");
     }
     Ok(())
-}
-
-/// Converts a clipboard error into an I/O error.
-fn clipboard_error(e: arboard::Error) -> io::Error {
-    io::Error::other(format!("clipboard error: {e}"))
 }
 
 /// Configures logging on stderr according to the number of `-v` flags.

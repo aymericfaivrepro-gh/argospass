@@ -1,8 +1,7 @@
 //! Random password generator.
 
-use crate::crypto::fill_random;
+use crate::{Error, Result};
 use log::debug;
-use std::io;
 use zeroize::Zeroizing;
 
 /// Default length of generated passwords.
@@ -21,12 +20,9 @@ const SYMBOLS: &[u8] = b"!#$%&()*+,-./:;<=>?@[]^_{|}~";
 ///
 /// Uses the operating system's CSPRNG and rejection sampling,
 /// so every allowed character has exactly the same probability.
-pub fn generate_password(length: usize, symbols: bool) -> io::Result<Zeroizing<String>> {
+pub fn generate_password(length: usize, symbols: bool) -> Result<Zeroizing<String>> {
     if length < MIN_LENGTH {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("password length must be at least {MIN_LENGTH}"),
-        ));
+        return Err(Error::PasswordTooShort { length });
     }
 
     let mut charset = Vec::new();
@@ -53,7 +49,7 @@ pub fn generate_password(length: usize, symbols: bool) -> io::Result<Zeroizing<S
     let mut random_bytes = Zeroizing::new([0u8; 64]);
     let mut rejected = 0usize;
     while password.len() < length {
-        fill_random(&mut *random_bytes)?;
+        getrandom::fill(&mut *random_bytes)?;
         for &byte in random_bytes.iter() {
             let value = byte as usize;
             if value < limit {
@@ -96,7 +92,10 @@ mod tests {
 
     #[test]
     fn rejects_too_short_length() {
-        assert!(generate_password(MIN_LENGTH - 1, true).is_err());
+        assert!(matches!(
+            generate_password(MIN_LENGTH - 1, true),
+            Err(Error::PasswordTooShort { length }) if length == MIN_LENGTH - 1
+        ));
     }
 
     #[test]

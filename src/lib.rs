@@ -1,7 +1,10 @@
 //! Password manager logic.
 pub mod crypto;
+mod error;
 pub mod format;
 pub mod generator;
+
+pub use error::{Error, Result};
 
 use crypto::{KdfParams, SALT_LEN, VaultKey};
 use format::{FORMAT_VERSION, HEADER_LEN, Header, MAGIC};
@@ -47,20 +50,21 @@ impl Vault {
     }
 
     /// Adds an entry to the vault.
-    /// Returns `false` if an entry with the same title already exists.
-    #[must_use]
-    pub fn add(&mut self, entry: Entry) -> bool {
-        if self.get(&entry.title).is_some() {
-            return false;
+    /// Fails with [`Error::EntryAlreadyExists`] if an entry has the same title.
+    pub fn add(&mut self, entry: Entry) -> Result<()> {
+        if self.entries.iter().any(|e| e.title == entry.title) {
+            return Err(Error::EntryAlreadyExists(entry.title.clone()));
         }
 
         self.entries.push(entry);
-        true
+        Ok(())
     }
 
     /// Finds an entry by its title.
-    pub fn get(&self, title: &str) -> Option<&Entry> {
-        self.entries.iter().find(|e| e.title == title)
+    /// Fails with [`Error::EntryNotFound`] if there is none.
+    pub fn get(&self, title: &str) -> Result<&Entry> {
+        let index = self.index_of(title)?;
+        Ok(&self.entries[index])
     }
 
     /// Returns all entries.
@@ -69,15 +73,26 @@ impl Vault {
     }
 
     /// Removes and returns an entry by its title.
-    pub fn remove(&mut self, title: &str) -> Option<Entry> {
-        let index = self.entries.iter().position(|e| e.title == title)?;
-        Some(self.entries.remove(index))
+    /// Fails with [`Error::EntryNotFound`] if there is none.
+    pub fn remove(&mut self, title: &str) -> Result<Entry> {
+        let index = self.index_of(title)?;
+        Ok(self.entries.remove(index))
+    }
+
+    /// Returns the position of the entry titled `title`.
+    fn index_of(&self, title: &str) -> Result<usize> {
+        self.entries
+            .iter()
+            .position(|e| e.title == title)
+            .ok_or_else(|| Error::EntryNotFound(title.to_string()))
     }
 
     /// Opens and decrypts a vault file with the master password.
     ///
     /// Vaults in the legacy format (before v1) are upgraded automatically.
-    pub fn open(path: &Path, password: &str) -> io::Result<(Self, VaultKey)> {
+    /// Fails with [`Error::DecryptionFailed`] if the master password is wrong
+    /// or if the file has been modified.
+    pub fn open(path: &Path, password: &str) -> Result<(Self, VaultKey)> {
         let data = fs::read(path)?;
         info!("opening vault");
         debug!("read {} bytes from {}", data.len(), path.display());
@@ -102,12 +117,9 @@ impl Vault {
     /// Opens a vault in the legacy layout (`salt || nonce || ciphertext || tag`,
     /// fixed Argon2id parameters, no associated data), then rewrites it in the
     /// current format. The legacy file is kept as the `.bak` backup.
-    fn open_legacy(path: &Path, password: &str, data: &[u8]) -> io::Result<(Self, VaultKey)> {
+    fn open_legacy(path: &Path, password: &str, data: &[u8]) -> Result<(Self, VaultKey)> {
         if data.len() < SALT_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "vault file is too short",
-            ));
+            return Err(Error::Truncated);
         }
 
         let (salt, encrypted) = data.split_at(SALT_LEN);
@@ -131,7 +143,7 @@ impl Vault {
     ///
     /// File layout: `header || nonce (24 bytes) || ciphertext || tag (16 bytes)`,
     /// where the header (see [`format`](mod@format)) is authenticated as associated data.
-    pub fn save(&self, path: &Path, key: &VaultKey) -> io::Result<()> {
+    pub fn save(&self, path: &Path, key: &VaultKey) -> Result<()> {
         info!("saving vault ({} entries)", self.entries.len());
         let plaintext = self.to_json()?;
         debug!(
@@ -148,7 +160,7 @@ impl Vault {
     }
 
     /// Serializes the vault to JSON in a buffer that is wiped on drop.
-    fn to_json(&self) -> io::Result<Zeroizing<Vec<u8>>> {
+    fn to_json(&self) -> Result<Zeroizing<Vec<u8>>> {
         // Size the buffer exactly first: if it grew while serializing, each
         // reallocation would leave an unwiped copy of the secrets behind.
         let mut counter = ByteCounter(0);
@@ -187,7 +199,7 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
 /// The data is written to a temporary file, flushed to disk, then renamed over
 /// the destination. The previous version is kept as a `.bak` file.
 /// On Unix, the file is created with `600` permissions (owner read/write only).
-fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let tmp_path = path.with_extension("argos.tmp");
     let backup_path = path.with_extension("argos.bak");
 
@@ -240,12 +252,14 @@ mod tests {
     #[test]
     fn adds_then_finds_entry() {
         let mut vault = Vault::new();
-        assert!(vault.add(Entry::new(
-            "Gmail",
-            "moi@gmail.com",
-            "secret",
-            Some("https://gmail.com"),
-        )));
+        vault
+            .add(Entry::new(
+                "Gmail",
+                "moi@gmail.com",
+                "secret",
+                Some("https://gmail.com"),
+            ))
+            .expect("add should succeed");
 
         let entry = vault.get("Gmail").expect("entry should exist");
         assert_eq!(entry.username, "moi@gmail.com");
@@ -254,19 +268,24 @@ mod tests {
     #[test]
     fn rejects_duplicate_title() {
         let mut vault = Vault::new();
-        assert!(vault.add(Entry::new(
-            "Gmail",
-            "premier",
-            "secret",
-            Some("https://gmail.com")
-        )));
+        vault
+            .add(Entry::new(
+                "Gmail",
+                "premier",
+                "secret",
+                Some("https://gmail.com"),
+            ))
+            .expect("add should succeed");
 
-        assert!(!vault.add(Entry::new(
-            "Gmail",
-            "second",
-            "autre-secret",
-            Some("https://gmail.com"),
-        )));
+        assert!(matches!(
+            vault.add(Entry::new(
+                "Gmail",
+                "second",
+                "autre-secret",
+                Some("https://gmail.com"),
+            )),
+            Err(Error::EntryAlreadyExists(title)) if title == "Gmail"
+        ));
         assert_eq!(vault.list().len(), 1);
         assert_eq!(
             vault.get("Gmail").expect("entry should exist").username,
@@ -275,24 +294,33 @@ mod tests {
     }
 
     #[test]
-    fn returns_none_for_missing_entry() {
+    fn missing_entry_is_not_found() {
         let vault = Vault::new();
-        assert!(vault.get("Inconnu").is_none());
+        assert!(matches!(
+            vault.get("Inconnu"),
+            Err(Error::EntryNotFound(title)) if title == "Inconnu"
+        ));
     }
 
     #[test]
     fn removes_an_entry() {
         let mut vault = Vault::new();
-        assert!(vault.add(Entry::new(
-            "Gmail",
-            "moi@gmail.com",
-            "secret",
-            Some("https://gmail.com"),
-        )));
+        vault
+            .add(Entry::new(
+                "Gmail",
+                "moi@gmail.com",
+                "secret",
+                Some("https://gmail.com"),
+            ))
+            .expect("add should succeed");
 
         let removed = vault.remove("Gmail").expect("entry should exist");
         assert_eq!(removed.title, "Gmail");
         assert!(vault.list().is_empty());
+        assert!(matches!(
+            vault.remove("Gmail"),
+            Err(Error::EntryNotFound(_))
+        ));
     }
     #[test]
     fn zeroize_wipes_entry_password() {
@@ -309,12 +337,14 @@ mod tests {
         let tricky = "\"quote\" \\back\\slash\n\t\u{1} éàü 🔐";
         let mut vault = Vault::new();
         for i in 0..50 {
-            assert!(vault.add(Entry::new(
-                &format!("{tricky} {i}"),
-                tricky,
-                &tricky.repeat(i + 1),
-                Some(tricky),
-            )));
+            vault
+                .add(Entry::new(
+                    &format!("{tricky} {i}"),
+                    tricky,
+                    &tricky.repeat(i + 1),
+                    Some(tricky),
+                ))
+                .expect("titles are unique");
         }
 
         let json = vault.to_json().expect("serialization should succeed");
