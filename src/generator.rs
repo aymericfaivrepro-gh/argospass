@@ -3,6 +3,7 @@
 use crate::crypto::fill_random;
 use log::debug;
 use std::io;
+use zeroize::Zeroizing;
 
 /// Default length of generated passwords.
 pub const DEFAULT_LENGTH: usize = 24;
@@ -20,7 +21,7 @@ const SYMBOLS: &[u8] = b"!#$%&()*+,-./:;<=>?@[]^_{|}~";
 ///
 /// Uses the operating system's CSPRNG and rejection sampling,
 /// so every allowed character has exactly the same probability.
-pub fn generate_password(length: usize, symbols: bool) -> io::Result<String> {
+pub fn generate_password(length: usize, symbols: bool) -> io::Result<Zeroizing<String>> {
     if length < MIN_LENGTH {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -45,12 +46,15 @@ pub fn generate_password(length: usize, symbols: bool) -> io::Result<String> {
         length as f64 * (n as f64).log2()
     );
 
-    let mut password = String::with_capacity(length);
-    let mut random_bytes = [0u8; 64];
+    // Only ASCII characters are pushed, so the capacity is never exceeded
+    // and no unwiped copy is left behind by a reallocation.
+    let mut password = Zeroizing::new(String::with_capacity(length));
+    // The password is derived from these bytes: wipe them too.
+    let mut random_bytes = Zeroizing::new([0u8; 64]);
     let mut rejected = 0usize;
     while password.len() < length {
-        fill_random(&mut random_bytes)?;
-        for &byte in &random_bytes {
+        fill_random(&mut *random_bytes)?;
+        for &byte in random_bytes.iter() {
             let value = byte as usize;
             if value < limit {
                 password.push(charset[value % n] as char);
@@ -80,6 +84,14 @@ mod tests {
     fn without_symbols_only_uses_letters_and_digits() {
         let password = generate_password(200, false).expect("generation should succeed");
         assert!(password.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn password_buffer_is_never_reallocated() {
+        // The capacity reserved up front must be enough: a reallocation
+        // would leave an unwiped copy of the password behind.
+        let password = generate_password(10_000, true).expect("generation should succeed");
+        assert_eq!(password.capacity(), 10_000);
     }
 
     #[test]

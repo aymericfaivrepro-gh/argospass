@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 /// How long a copied password stays in the clipboard, in seconds.
 const CLIPBOARD_TIMEOUT_SECS: u64 = 20;
@@ -93,7 +94,7 @@ fn run() -> io::Result<()> {
     match cli.command {
         Command::Init => init(&path),
         Command::Generate { length, no_symbols } => {
-            println!("{}", generate_password(length, !no_symbols)?);
+            println!("{}", *generate_password(length, !no_symbols)?);
             Ok(())
         }
         command => execute(&path, command),
@@ -147,8 +148,10 @@ fn execute(path: &Path, command: Command) -> io::Result<()> {
         ));
     }
 
-    let master_password = rpassword::prompt_password("Master password: ")?;
-    let (mut vault, key) = Vault::open(path, &master_password)?;
+    let (mut vault, key) = {
+        let master_password = Zeroizing::new(rpassword::prompt_password("Master password: ")?);
+        Vault::open(path, &master_password)?
+    };
 
     match command {
         Command::Init | Command::Generate { .. } => unreachable!("handled in run()"),
@@ -217,11 +220,11 @@ fn execute(path: &Path, command: Command) -> io::Result<()> {
 
 /// Prompts twice for a new password with hidden input.
 /// Returns `None` if the password is empty or the two inputs differ.
-fn ask_new_password(prompt: &str) -> io::Result<Option<String>> {
-    let password = rpassword::prompt_password(prompt)?;
-    let confirmation = rpassword::prompt_password("Confirm: ")?;
+fn ask_new_password(prompt: &str) -> io::Result<Option<Zeroizing<String>>> {
+    let password = Zeroizing::new(rpassword::prompt_password(prompt)?);
+    let confirmation = Zeroizing::new(rpassword::prompt_password("Confirm: ")?);
 
-    if password.is_empty() || password != confirmation {
+    if password.is_empty() || *password != *confirmation {
         return Ok(None);
     }
     Ok(Some(password))
@@ -263,7 +266,11 @@ fn copy_temporarily(secret: &str) -> io::Result<()> {
     }
     println!();
 
-    if clipboard.get_text().is_ok_and(|current| current == secret) {
+    // The text read back may be the password: wipe it too.
+    let still_ours = clipboard
+        .get_text()
+        .is_ok_and(|current| *Zeroizing::new(current) == secret);
+    if still_ours {
         debug!("clipboard still contains the password: overwriting it");
         // Overwrite rather than clear: more reliable across clipboard bridges such as WSLg.
         clipboard.set_text("").map_err(clipboard_error)?;

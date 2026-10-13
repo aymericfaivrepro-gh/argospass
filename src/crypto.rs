@@ -1,12 +1,13 @@
 //! Cryptography: deriving a key from the master password.
 
 use crate::to_hex;
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use log::{debug, info};
 use std::io;
 use std::time::Instant;
+use zeroize::Zeroizing;
 
 /// Encryption key size: 32 bytes (256 bits).
 pub const KEY_LEN: usize = 32;
@@ -30,7 +31,9 @@ const PARALLELISM: u32 = 4;
 /// and the key derived from the master password.
 pub struct VaultKey {
     pub(crate) salt: [u8; SALT_LEN],
-    pub(crate) key: [u8; KEY_LEN],
+    /// Boxed so that moving `VaultKey` around only copies a pointer,
+    /// never the key bytes themselves.
+    pub(crate) key: Box<Zeroizing<[u8; KEY_LEN]>>,
 }
 
 impl VaultKey {
@@ -88,7 +91,7 @@ pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> io::Result<Vec<u8>> {
 /// Decrypts data produced by [`encrypt`].
 ///
 /// Fails if the key is wrong or if the data has been modified.
-pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8]) -> io::Result<Vec<u8>> {
+pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
     if data.len() < NONCE_LEN + TAG_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -107,6 +110,7 @@ pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8]) -> io::Result<Vec<u8>> {
 
     cipher
         .decrypt(XNonce::from_slice(nonce), ciphertext)
+        .map(Zeroizing::new)
         .map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -116,7 +120,10 @@ pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 /// Derives a 256-bit key from the master password and salt.
-pub fn derive_key(password: &str, salt: &[u8; SALT_LEN]) -> io::Result<[u8; KEY_LEN]> {
+pub fn derive_key(
+    password: &str,
+    salt: &[u8; SALT_LEN],
+) -> io::Result<Box<Zeroizing<[u8; KEY_LEN]>>> {
     info!(
         "deriving key with Argon2id ({} MiB, {} iterations, parallelism {})",
         MEMORY_KIB / 1024,
@@ -127,15 +134,17 @@ pub fn derive_key(password: &str, salt: &[u8; SALT_LEN]) -> io::Result<[u8; KEY_
 
     let params = Params::new(MEMORY_KIB, ITERATIONS, PARALLELISM, Some(KEY_LEN))
         .map_err(|e| io::Error::other(e.to_string()))?;
+    // Argon2's working memory is derived from the password and is enough to
+    // recompute the key: provide it ourselves so that it is wiped afterwards.
+    let mut blocks = Zeroizing::new(vec![Block::default(); params.block_count()]);
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
-    let mut key = [0u8; KEY_LEN];
+    let mut key = Box::new(Zeroizing::new([0u8; KEY_LEN]));
     argon2
-        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .hash_password_into_with_memory(password.as_bytes(), salt, &mut **key, &mut *blocks)
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     info!("key derived in {:?}", start.elapsed());
-    // Never log `key` or `password`.
     Ok(key)
 }
 
@@ -177,7 +186,7 @@ mod tests {
         let key = [42u8; KEY_LEN];
         let encrypted = encrypt(&key, b"hello vault").expect("encryption should succeed");
         let decrypted = decrypt(&key, &encrypted).expect("decryption should succeed");
-        assert_eq!(decrypted, b"hello vault");
+        assert_eq!(decrypted.as_slice(), b"hello vault");
     }
 
     #[test]
@@ -226,5 +235,29 @@ mod tests {
             let hex: String = encrypted.iter().map(|b| format!("{b:02x}")).collect();
             println!("{hex}");
         }
+    }
+    #[test]
+    fn caller_provided_memory_gives_the_standard_argon2_key() {
+        // Providing Argon2's memory ourselves must not change the key,
+        // otherwise existing vaults could no longer be opened.
+        let salt = [7u8; SALT_LEN];
+        let params = Params::new(MEMORY_KIB, ITERATIONS, PARALLELISM, Some(KEY_LEN))
+            .expect("valid parameters");
+        let mut expected = [0u8; KEY_LEN];
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+            .hash_password_into(b"correct horse", &salt, &mut expected)
+            .expect("derivation");
+
+        let key = derive_key("correct horse", &salt).expect("derivation");
+        assert_eq!(**key, expected);
+    }
+
+    #[test]
+    fn zeroize_wipes_key_bytes() {
+        use zeroize::Zeroize;
+
+        let mut key = Zeroizing::new([42u8; KEY_LEN]);
+        key.zeroize();
+        assert_eq!(*key, [0u8; KEY_LEN]);
     }
 }

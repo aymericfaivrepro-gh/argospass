@@ -9,9 +9,10 @@ use std::fs;
 use std::io;
 use std::io::Write;
 use std::path::Path;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// A vault entry: an account and its password.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct Entry {
     pub title: String,
     pub username: String,
@@ -103,7 +104,7 @@ impl Vault {
     /// File layout: `salt (16 bytes) || nonce (24 bytes) || ciphertext || tag (16 bytes)`.
     pub fn save(&self, path: &Path, key: &VaultKey) -> io::Result<()> {
         info!("saving vault ({} entries)", self.entries.len());
-        let plaintext = serde_json::to_vec(self)?;
+        let plaintext = self.to_json()?;
         debug!(
             "serialized vault to {} bytes of JSON (not shown: it contains secrets)",
             plaintext.len()
@@ -114,6 +115,33 @@ impl Vault {
         data.extend_from_slice(&key.salt);
         data.extend_from_slice(&encrypted);
         write_atomic(path, &data)
+    }
+
+    /// Serializes the vault to JSON in a buffer that is wiped on drop.
+    fn to_json(&self) -> io::Result<Zeroizing<Vec<u8>>> {
+        // Size the buffer exactly first: if it grew while serializing, each
+        // reallocation would leave an unwiped copy of the secrets behind.
+        let mut counter = ByteCounter(0);
+        serde_json::to_writer(&mut counter, self)?;
+        let mut json = Zeroizing::new(Vec::with_capacity(counter.0));
+        let capacity = json.capacity();
+        serde_json::to_writer(&mut *json, self)?;
+        debug_assert_eq!(json.capacity(), capacity, "buffer was reallocated");
+        Ok(json)
+    }
+}
+
+/// A writer that discards its input and only counts the bytes written.
+struct ByteCounter(usize);
+
+impl Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -235,5 +263,40 @@ mod tests {
         let removed = vault.remove("Gmail").expect("entry should exist");
         assert_eq!(removed.title, "Gmail");
         assert!(vault.list().is_empty());
+    }
+    #[test]
+    fn zeroize_wipes_entry_password() {
+        let mut entry = Entry::new("Gmail", "me@gmail.com", "secret", None);
+        entry.zeroize();
+        assert!(entry.password.is_empty());
+    }
+
+    #[test]
+    fn json_buffer_is_never_reallocated() {
+        // Characters that serde_json escapes (quote, backslash, control
+        // characters) or that take several bytes in UTF-8 (accents, emoji):
+        // the output size differs most from the input size here.
+        let tricky = "\"quote\" \\back\\slash\n\t\u{1} éàü 🔐";
+        let mut vault = Vault::new();
+        for i in 0..50 {
+            assert!(vault.add(Entry::new(
+                &format!("{tricky} {i}"),
+                tricky,
+                &tricky.repeat(i + 1),
+                Some(tricky),
+            )));
+        }
+
+        let json = vault.to_json().expect("serialization should succeed");
+        // Exactly sized and never grown: a reallocation would have at least
+        // doubled the capacity.
+        assert_eq!(json.len(), json.capacity());
+
+        let parsed: Vault = serde_json::from_slice(&json).expect("valid JSON");
+        assert_eq!(parsed.list().len(), 50);
+        assert_eq!(
+            parsed.get(&format!("{tricky} 7")).unwrap().password,
+            tricky.repeat(8)
+        );
     }
 }
