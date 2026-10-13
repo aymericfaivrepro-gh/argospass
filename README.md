@@ -75,6 +75,7 @@ Logs go to **stderr**, so they never mix with a command's output. They only show
 | Windows | `%APPDATA%\argospass\vault.argos` |
 
 The previous version of the vault is kept next to it as `vault.argos.bak`.
+> ⚠️ ArgosPass is developed and tested on Linux (including WSL). Windows and macOS paths are given for reference; these platforms are not tested yet.
 
 ### Exit codes
 
