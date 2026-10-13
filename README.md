@@ -2,13 +2,22 @@
 
 A command-line password manager written in Rust. Entries live in a single local file, encrypted with a key derived from your master password.
 
-> ⚠️ **Personal learning project.** ArgosPass is still in developpement and it has not been audited by a third party. Use it at your own risk and keep backups of your vault.
-> 
+> ⚠️ **Personal learning project.** ArgosPass is still in development and it has not been audited by a third party. Use it at your own risk and keep backups of your vault.
+
+## Installation
+
+### Requirements
+
+- A recent stable [Rust toolchain](https://rustup.rs) (edition 2024)
+- On Linux: a C linker (`sudo apt install build-essential`)
+- For clipboard support on Linux: a graphical session (X11 or Wayland; WSLg works under WSL)
 
 ### Build and install
 
 ```bash
-git clone git@github.com:aymericfaivrepro-gh/argospass.gitcd argospasscargo install --path .
+git clone git@github.com:aymericfaivrepro-gh/argospass.git
+cd argospass
+cargo install --path .
 ```
 
 This installs the `argospass` binary in `~/.cargo/bin`. Make sure that directory is in your `PATH`.
@@ -46,6 +55,15 @@ You get **3 attempts** to type the master password.
 
 The clipboard is only cleared if it still contains the password ArgosPass put there, so anything you copied in the meantime is not erased.
 
+### Global options
+
+| Option | Effect |
+| --- | --- |
+| `--vault <PATH>` | Use another vault file |
+| `ARGOSPASS_VAULT=<PATH>` | Same, through an environment variable |
+| `-v` | Show the main steps (key derivation time, file read/written…) |
+| `-vv` | Show every detail (sizes, salt, nonce, Argon2 parameters, generator statistics…) |
+
 Logs go to **stderr**, so they never mix with a command's output. They only show public values. The master password, keys, decrypted content and entry passwords are never logged.
 
 ### Vault location
@@ -56,12 +74,14 @@ Logs go to **stderr**, so they never mix with a command's output. They only show
 | macOS | `~/Library/Application Support/argospass/vault.argos` |
 | Windows | `%APPDATA%\argospass\vault.argos` |
 
+The previous version of the vault is kept next to it as `vault.argos.bak`.
+
 ### Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | `0` | Success |
-| `1` | Other error  |
+| `1` | Other error |
 | `2` | Invalid command-line usage |
 | `3` | Wrong master password, or corrupted vault |
 | `4` | Invalid or unsupported vault file |
@@ -82,13 +102,14 @@ Logs go to **stderr**, so they never mix with a command's output. They only show
 | **Crash or power loss during a save** | Atomic write: the old vault stays intact until the new one is fully on disk, and a `.bak` copy is kept. |
 | **Other users of the same machine** | On Unix, the vault is created with `600` permissions and its directory with `700`. |
 | **Shoulder surfing and shell history** | Passwords are never command-line arguments and are typed with hidden input. By default, `get` copies to the clipboard instead of printing. |
-| **Secrets lingering in memory** | Keys, decrypted content and passwords are overwritten when no longer needed |
+| **Secrets lingering in memory** | Keys, decrypted content and passwords are overwritten when no longer needed (see [Secrets in memory](#secrets-in-memory)). |
 
 ### What ArgosPass does not protect against
 
 - **A compromised machine.** Malware, a keylogger or an administrator can read the master password as you type it, or the decrypted vault while ArgosPass runs. No password manager can defend against that.
 - **A weak master password.** Argon2id slows down guessing but cannot save a short or common password. Use a long passphrase, for example 5 or more random words.
 - **A forgotten master password.** There is no recovery mechanism or back door. A lost password means a lost vault.
+- **Rollback.** An attacker who can write the file can replace it with an **older, valid** version of your vault, and ArgosPass will not notice yet.
 - **Metadata.** The file size reveals the approximate size of the content, so roughly how many entries you have. The modification date shows when you last changed it.
 
 ## Cryptography
@@ -123,7 +144,7 @@ nonce ‖ ciphertext ‖ tag ─────────►  decrypt + verify ta
 1. The entries are serialized to JSON into a buffer that will be wiped afterwards.
 2. A new random 24-byte nonce is generated. **Every save uses a fresh nonce**, so the file changes completely even when its content does not.
 3. The JSON is encrypted with the header as associated data.
-4. The file is written atomically.
+4. The file is written atomically (see [Atomic writes](#atomic-writes)).
 
 The key is derived once, when the vault is unlocked, and reused for the save. The salt and parameters stay the same for the vault's lifetime.
 
@@ -152,7 +173,7 @@ Characters are drawn from up to 4 sets, using the OS CSPRNG:
 | Lowercase | `a`–`z` (26) |
 | Uppercase | `A`–`Z` (26) |
 | Digits | `0`–`9` (10) |
-| Symbols | ``!#$%&()*+,-./:;<=>?@[]^_{ |
+| Symbols | `!#$%&()*+,-./:;<=>?@[]^_{\|}~` (28) |
 
 Each character is chosen with **rejection sampling**: random bytes that would make some characters more likely than others are discarded. Every character is therefore exactly equally likely.
 
@@ -177,18 +198,29 @@ Each character is chosen with **rejection sampling**: random bytes that would ma
 | 58 | n | Encrypted JSON |
 | 58 + n | 16 | Poly1305 authentication tag |
 
-The header is stored **in clear**, since it is needed to derive the key, but it is **authenticated**: changing a single bit makes opening fail. An empty vault takes 88 bytes.
+The first 34 bytes form the header. It is stored **in clear**, since it is needed to derive the key, but it is **authenticated**: changing a single bit makes opening fail. An empty vault takes 88 bytes.
 
 The salt and the nonce are not secret. Their job is to be unique: the salt makes each vault's key different even with the same password (and rules out precomputed tables), and the nonce makes each encryption different.
+
+### Legacy format (version 0)
+
+The first versions of ArgosPass wrote `salt (16) ‖ nonce (24) ‖ ciphertext ‖ tag (16)`, with no header and no associated data. These files are still recognized (no magic bytes), opened with the default parameters of the time, and **automatically re-saved in version 1**. A warning is shown when this happens.
 
 ### Decrypted content
 
 Once decrypted, the vault is a JSON document:
 
-json
-
 ```json
-{  "entries": [    {      "title": "GitHub",      "username": "User",      "password": "password",      "url": "https://github.com"    }  ]}
+{
+  "entries": [
+    {
+      "title": "GitHub",
+      "username": "User",
+      "password": "password",
+      "url": "https://github.com"
+    }
+  ]
+}
 ```
 
 This plaintext only ever exists in memory. It is never written to disk.
@@ -210,7 +242,7 @@ When freed, memory is not erased: secrets could remain in RAM, then end up in a 
 | Secret | Protection |
 | --- | --- |
 | Derived key | `Box<Zeroizing<[u8; 32]>>`: stored once on the heap (never copied around the stack) and wiped on drop |
-| Argon2 working memory (64 MiB) | Allocated by ArgosPass in a `Zeroizing` buffer and wiped after the derivation. The `argon2` crate would otherwise free it without wiping it. |
+| Argon2 working memory (128 MiB by default) | Allocated by ArgosPass in a `Zeroizing` buffer and wiped after the derivation. The `argon2` crate would otherwise free it without wiping it. |
 | Decrypted JSON | `Zeroizing<Vec<u8>>` |
 | JSON before encryption | Exact size computed first, so the buffer never reallocates and leaves no unwiped copies behind |
 | Entries | `Entry` implements `ZeroizeOnDrop`: every field is wiped when the entry is dropped |
@@ -219,10 +251,10 @@ When freed, memory is not erased: secrets could remain in RAM, then end up in a 
 ## Known limitations
 
 - **Swap:** memory pages are not locked (`mlock`), so the operating system could write a secret to swap before it is wiped.
-- **Copies outside ArgosPass:** the terminal (with `-show`), the clipboard, and especially **clipboard history** tools (`Win + V` on Windows, clipboard managers on Linux) may keep a copy that ArgosPass cannot erase.
+- **Copies outside ArgosPass:** the terminal (with `--show`), the clipboard, and especially **clipboard history** tools (`Win + V` on Windows, clipboard managers on Linux) may keep a copy that ArgosPass cannot erase.
 - **Ctrl+C during `get`:** interrupting the 20-second countdown leaves the password in the clipboard.
 - **Whole vault decrypted at once:** every entry is in clear in memory while a command runs, not only the one you asked for.
-- **No rollback protection** and **file size not hidden**.
+- **No rollback protection** and **file size not hidden** (see [Security model](#security-model)).
 - **The master password cannot be changed yet.**
 
 ## Development
@@ -269,7 +301,7 @@ During development, always use a test vault (`--vault /tmp/...`), never your rea
 
 Licensed under either of
 
-- Apache License, Version 2.0
-- MIT license
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
