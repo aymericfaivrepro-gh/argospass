@@ -1,9 +1,11 @@
 //! Password manager logic.
 pub mod crypto;
+pub mod format;
 pub mod generator;
 
-use crypto::{SALT_LEN, VaultKey};
-use log::{debug, info};
+use crypto::{KdfParams, SALT_LEN, VaultKey};
+use format::{FORMAT_VERSION, HEADER_LEN, Header, MAGIC};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -71,14 +73,36 @@ impl Vault {
         let index = self.entries.iter().position(|e| e.title == title)?;
         Some(self.entries.remove(index))
     }
-    /// Opens and decrypts an existing vault file with the master password.
+
+    /// Opens and decrypts a vault file with the master password.
     ///
-    /// Returns the vault and the key material needed to save it again.
-    /// Fails if the password is wrong or if the file has been modified.
+    /// Vaults in the legacy format (before v1) are upgraded automatically.
     pub fn open(path: &Path, password: &str) -> io::Result<(Self, VaultKey)> {
         let data = fs::read(path)?;
         info!("opening vault");
         debug!("read {} bytes from {}", data.len(), path.display());
+
+        if !data.starts_with(MAGIC) {
+            return Self::open_legacy(path, password, &data);
+        }
+
+        let header = Header::from_bytes(&data)?;
+        debug!("format version {FORMAT_VERSION}, {:?}", header.params);
+        debug!("salt (from file header): {}", to_hex(&header.salt));
+
+        let (header_bytes, encrypted) = data.split_at(HEADER_LEN);
+        let key = VaultKey::from_header(password, header)?;
+        let plaintext = crypto::decrypt(&key.key, encrypted, header_bytes)?;
+
+        let vault: Vault = serde_json::from_slice(&plaintext)?;
+        info!("vault decrypted: {} entries", vault.entries.len());
+        Ok((vault, key))
+    }
+
+    /// Opens a vault in the legacy layout (`salt || nonce || ciphertext || tag`,
+    /// fixed Argon2id parameters, no associated data), then rewrites it in the
+    /// current format. The legacy file is kept as the `.bak` backup.
+    fn open_legacy(path: &Path, password: &str, data: &[u8]) -> io::Result<(Self, VaultKey)> {
         if data.len() < SALT_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -87,21 +111,26 @@ impl Vault {
         }
 
         let (salt, encrypted) = data.split_at(SALT_LEN);
-        let salt: [u8; SALT_LEN] = salt
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid salt"))?;
-        debug!("salt (from file header): {}", to_hex(&salt));
+        let header = Header {
+            params: KdfParams::LEGACY,
+            salt: salt.try_into().expect("length checked above"),
+        };
+        debug!("legacy vault, salt: {}", to_hex(&header.salt));
 
-        let key = VaultKey::from_salt(password, salt)?;
-        let plaintext = crypto::decrypt(&key.key, encrypted)?;
+        let key = VaultKey::from_header(password, header)?;
+        let plaintext = crypto::decrypt(&key.key, encrypted, &[])?;
         let vault: Vault = serde_json::from_slice(&plaintext)?;
         info!("vault decrypted: {} entries", vault.entries.len());
+
+        warn!("vault uses the legacy format: upgrading it to format v{FORMAT_VERSION}");
+        vault.save(path, &key)?;
         Ok((vault, key))
     }
 
     /// Encrypts and writes the vault to a file.
     ///
-    /// File layout: `salt (16 bytes) || nonce (24 bytes) || ciphertext || tag (16 bytes)`.
+    /// File layout: `header || nonce (24 bytes) || ciphertext || tag (16 bytes)`,
+    /// where the header (see [`format`](mod@format)) is authenticated as associated data.
     pub fn save(&self, path: &Path, key: &VaultKey) -> io::Result<()> {
         info!("saving vault ({} entries)", self.entries.len());
         let plaintext = self.to_json()?;
@@ -109,10 +138,11 @@ impl Vault {
             "serialized vault to {} bytes of JSON (not shown: it contains secrets)",
             plaintext.len()
         );
-        let encrypted = crypto::encrypt(&key.key, &plaintext)?;
+        let header_bytes = key.header.to_bytes();
+        let encrypted = crypto::encrypt(&key.key, &plaintext, &header_bytes)?;
 
-        let mut data = Vec::with_capacity(SALT_LEN + encrypted.len());
-        data.extend_from_slice(&key.salt);
+        let mut data = Vec::with_capacity(HEADER_LEN + encrypted.len());
+        data.extend_from_slice(&header_bytes);
         data.extend_from_slice(&encrypted);
         write_atomic(path, &data)
     }

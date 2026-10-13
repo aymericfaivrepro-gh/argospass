@@ -1,8 +1,9 @@
 //! Cryptography: deriving a key from the master password.
 
+use crate::format::Header;
 use crate::to_hex;
 use argon2::{Algorithm, Argon2, Block, Params, Version};
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use log::{debug, info};
 use std::io;
@@ -21,32 +22,89 @@ pub const NONCE_LEN: usize = 24;
 /// Poly1305 authentication tag length: 16 bytes.
 pub const TAG_LEN: usize = 16;
 
-/// Argon2id memory cost, in KiB (here 64 MiB).
-const MEMORY_KIB: u32 = 64 * 1024;
-/// Number of passes over memory.
-const ITERATIONS: u32 = 3;
-/// Degree of parallelism.
-const PARALLELISM: u32 = 4;
-/// Key material of an unlocked vault: the salt stored in the file
+/// Argon2id cost parameters, stored in the vault header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KdfParams {
+    /// Memory cost, in KiB.
+    pub memory_kib: u32,
+    /// Number of passes over memory.
+    pub iterations: u32,
+    /// Degree of parallelism.
+    pub parallelism: u32,
+}
+
+impl KdfParams {
+    /// Parameters used for new vaults.
+    pub const DEFAULT: Self = Self {
+        memory_kib: 128 * 1024,
+        iterations: 3,
+        parallelism: 4,
+    };
+
+    /// Parameters hard-coded in vaults written before format v1.
+    /// Must never change, even if `DEFAULT` does.
+    pub const LEGACY: Self = Self {
+        memory_kib: 64 * 1024,
+        iterations: 3,
+        parallelism: 4,
+    };
+
+    /// Weakest parameters accepted when opening a vault.
+    pub const MINIMUM: Self = Self {
+        memory_kib: 64 * 1024,
+        iterations: 3,
+        parallelism: 1,
+    };
+
+    /// Strongest parameters accepted when opening a vault: a crafted header
+    /// must not be able to exhaust memory or CPU before the tag is checked.
+    pub const MAXIMUM: Self = Self {
+        memory_kib: 4 * 1024 * 1024,
+        iterations: 64,
+        parallelism: 64,
+    };
+
+    /// Checks that the parameters are within the accepted bounds.
+    pub fn validate(&self) -> io::Result<()> {
+        let (min, max) = (Self::MINIMUM, Self::MAXIMUM);
+        let valid = (min.memory_kib..=max.memory_kib).contains(&self.memory_kib)
+            && (min.iterations..=max.iterations).contains(&self.iterations)
+            && (min.parallelism..=max.parallelism).contains(&self.parallelism);
+
+        if valid {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported Argon2id parameters: {self:?}"),
+            ))
+        }
+    }
+}
+
+/// Key material of an unlocked vault: its header (salt and Argon2id parameters)
 /// and the key derived from the master password.
 pub struct VaultKey {
-    pub(crate) salt: [u8; SALT_LEN],
+    pub(crate) header: Header,
     /// Boxed so that moving `VaultKey` around only copies a pointer,
     /// never the key bytes themselves.
     pub(crate) key: Box<Zeroizing<[u8; KEY_LEN]>>,
 }
 
 impl VaultKey {
-    /// Creates key material for a new vault: generates a fresh salt and derives the key.
+    /// Creates key material for a new vault: fresh salt, default parameters.
     pub fn new(password: &str) -> io::Result<Self> {
-        let salt = generate_salt()?;
-        Self::from_salt(password, salt)
+        let header = Header {
+            params: KdfParams::DEFAULT,
+            salt: generate_salt()?,
+        };
+        Self::from_header(password, header)
     }
 
-    /// Re-derives the key of an existing vault from its stored salt.
-    pub fn from_salt(password: &str, salt: [u8; SALT_LEN]) -> io::Result<Self> {
-        let key = derive_key(password, &salt)?;
-        Ok(Self { salt, key })
+    /// Re-derives the key of an existing vault from its header.
+    pub fn from_header(password: &str, header: Header) -> io::Result<Self> {
+        let key = derive_key(password, &header.salt, &header.params)?;
+        Ok(Self { header, key })
     }
 }
 /// Fills `buf` with random bytes from the operating system's CSPRNG.
@@ -66,14 +124,20 @@ pub fn generate_salt() -> io::Result<[u8; SALT_LEN]> {
 ///
 /// A fresh random nonce is generated on every call.
 /// Output layout: `nonce (24 bytes) || ciphertext || tag (16 bytes)`.
-pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> io::Result<Vec<u8>> {
+pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> io::Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
 
     let mut nonce = [0u8; NONCE_LEN];
     fill_random(&mut nonce)?;
 
     let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), plaintext)
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| io::Error::other("encryption failed"))?;
     debug!("generated random nonce: {}", to_hex(&nonce));
     debug!(
@@ -91,7 +155,7 @@ pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> io::Result<Vec<u8>> {
 /// Decrypts data produced by [`encrypt`].
 ///
 /// Fails if the key is wrong or if the data has been modified.
-pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
+pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8], aad: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
     if data.len() < NONCE_LEN + TAG_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -109,7 +173,13 @@ pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8]) -> io::Result<Zeroizing<Vec<u8>
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
 
     cipher
-        .decrypt(XNonce::from_slice(nonce), ciphertext)
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map(Zeroizing::new)
         .map_err(|_| {
             io::Error::new(
@@ -123,25 +193,31 @@ pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8]) -> io::Result<Zeroizing<Vec<u8>
 pub fn derive_key(
     password: &str,
     salt: &[u8; SALT_LEN],
+    params: &KdfParams,
 ) -> io::Result<Box<Zeroizing<[u8; KEY_LEN]>>> {
     info!(
         "deriving key with Argon2id ({} MiB, {} iterations, parallelism {})",
-        MEMORY_KIB / 1024,
-        ITERATIONS,
-        PARALLELISM
+        params.memory_kib / 1024,
+        params.iterations,
+        params.parallelism
     );
     let start = Instant::now();
 
-    let params = Params::new(MEMORY_KIB, ITERATIONS, PARALLELISM, Some(KEY_LEN))
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    let argon2_params = Params::new(
+        params.memory_kib,
+        params.iterations,
+        params.parallelism,
+        Some(KEY_LEN),
+    )
+    .map_err(|e| io::Error::other(e.to_string()))?;
+
     // Argon2's working memory is derived from the password and is enough to
     // recompute the key: provide it ourselves so that it is wiped afterwards.
-    let mut blocks = Zeroizing::new(vec![Block::default(); params.block_count()]);
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-
+    let mut memory = Zeroizing::new(vec![Block::default(); argon2_params.block_count()]);
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon2_params);
     let mut key = Box::new(Zeroizing::new([0u8; KEY_LEN]));
     argon2
-        .hash_password_into_with_memory(password.as_bytes(), salt, &mut **key, &mut *blocks)
+        .hash_password_into_with_memory(password.as_bytes(), salt, &mut **key, &mut *memory)
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     info!("key derived in {:?}", start.elapsed());
@@ -155,23 +231,25 @@ mod tests {
     #[test]
     fn same_password_and_same_salt_produce_the_same_key() {
         let salt = [7u8; SALT_LEN];
-        let k1 = derive_key("correct horse", &salt).expect("derivation");
-        let k2 = derive_key("correct horse", &salt).expect("derivation");
+        let k1 = derive_key("correct horse", &salt, &KdfParams::DEFAULT).expect("derivation");
+        let k2 = derive_key("correct horse", &salt, &KdfParams::DEFAULT).expect("derivation");
         assert_eq!(k1, k2);
     }
 
     #[test]
     fn different_salt_produces_a_different_key() {
-        let k1 = derive_key("correct horse", &[1u8; SALT_LEN]).expect("derivation");
-        let k2 = derive_key("correct horse", &[2u8; SALT_LEN]).expect("derivation");
+        let k1 =
+            derive_key("correct horse", &[1u8; SALT_LEN], &KdfParams::DEFAULT).expect("derivation");
+        let k2 =
+            derive_key("correct horse", &[2u8; SALT_LEN], &KdfParams::DEFAULT).expect("derivation");
         assert_ne!(k1, k2);
     }
 
     #[test]
     fn different_password_produces_a_different_key() {
         let salt = [7u8; SALT_LEN];
-        let k1 = derive_key("correct horse", &salt).expect("derivation");
-        let k2 = derive_key("correct hors3", &salt).expect("derivation");
+        let k1 = derive_key("correct horse", &salt, &KdfParams::DEFAULT).expect("derivation");
+        let k2 = derive_key("correct hors3", &salt, &KdfParams::DEFAULT).expect("derivation");
         assert_ne!(k1, k2);
     }
 
@@ -184,8 +262,8 @@ mod tests {
     #[test]
     fn encrypt_then_decrypt_returns_plaintext() {
         let key = [42u8; KEY_LEN];
-        let encrypted = encrypt(&key, b"hello vault").expect("encryption should succeed");
-        let decrypted = decrypt(&key, &encrypted).expect("decryption should succeed");
+        let encrypted = encrypt(&key, b"hello vault", &[]).expect("encryption should succeed");
+        let decrypted = decrypt(&key, &encrypted, &[]).expect("decryption should succeed");
         assert_eq!(decrypted.as_slice(), b"hello vault");
     }
 
@@ -193,45 +271,45 @@ mod tests {
     fn output_has_expected_length() {
         let key = [42u8; KEY_LEN];
         let plaintext = b"hello vault";
-        let encrypted = encrypt(&key, plaintext).expect("encryption should succeed");
+        let encrypted = encrypt(&key, plaintext, &[]).expect("encryption should succeed");
         assert_eq!(encrypted.len(), NONCE_LEN + plaintext.len() + TAG_LEN);
     }
 
     #[test]
     fn same_plaintext_encrypts_differently_each_time() {
         let key = [42u8; KEY_LEN];
-        let a = encrypt(&key, b"hello vault").expect("encryption should succeed");
-        let b = encrypt(&key, b"hello vault").expect("encryption should succeed");
+        let a = encrypt(&key, b"hello vault", &[]).expect("encryption should succeed");
+        let b = encrypt(&key, b"hello vault", &[]).expect("encryption should succeed");
         assert_ne!(a, b);
     }
 
     #[test]
     fn wrong_key_fails_to_decrypt() {
         let encrypted =
-            encrypt(&[1u8; KEY_LEN], b"hello vault").expect("encryption should succeed");
-        assert!(decrypt(&[2u8; KEY_LEN], &encrypted).is_err());
+            encrypt(&[1u8; KEY_LEN], b"hello vault", &[]).expect("encryption should succeed");
+        assert!(decrypt(&[2u8; KEY_LEN], &encrypted, &[]).is_err());
     }
 
     #[test]
     fn tampered_data_fails_to_decrypt() {
         let key = [42u8; KEY_LEN];
-        let mut encrypted = encrypt(&key, b"hello vault").expect("encryption should succeed");
+        let mut encrypted = encrypt(&key, b"hello vault", &[]).expect("encryption should succeed");
         let last = encrypted.len() - 1;
         encrypted[last] ^= 0x01; // flip one bit
-        assert!(decrypt(&key, &encrypted).is_err());
+        assert!(decrypt(&key, &encrypted, &[]).is_err());
     }
 
     #[test]
     fn too_short_data_fails_to_decrypt() {
         let key = [42u8; KEY_LEN];
-        assert!(decrypt(&key, &[0u8; 10]).is_err());
+        assert!(decrypt(&key, &[0u8; 10], &[]).is_err());
     }
 
     #[test]
     fn show_encryption() {
         let key = [42u8; KEY_LEN];
         for _ in 0..2 {
-            let encrypted = encrypt(&key, b"hello vault").expect("encryption should succeed");
+            let encrypted = encrypt(&key, b"hello vault", &[]).expect("encryption should succeed");
             let hex: String = encrypted.iter().map(|b| format!("{b:02x}")).collect();
             println!("{hex}");
         }
@@ -241,14 +319,15 @@ mod tests {
         // Providing Argon2's memory ourselves must not change the key,
         // otherwise existing vaults could no longer be opened.
         let salt = [7u8; SALT_LEN];
-        let params = Params::new(MEMORY_KIB, ITERATIONS, PARALLELISM, Some(KEY_LEN))
+        let p = KdfParams::DEFAULT;
+        let params = Params::new(p.memory_kib, p.iterations, p.parallelism, Some(KEY_LEN))
             .expect("valid parameters");
         let mut expected = [0u8; KEY_LEN];
         Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
             .hash_password_into(b"correct horse", &salt, &mut expected)
             .expect("derivation");
 
-        let key = derive_key("correct horse", &salt).expect("derivation");
+        let key = derive_key("correct horse", &salt, &KdfParams::DEFAULT).expect("derivation");
         assert_eq!(**key, expected);
     }
 
@@ -259,5 +338,13 @@ mod tests {
         let mut key = Zeroizing::new([42u8; KEY_LEN]);
         key.zeroize();
         assert_eq!(*key, [0u8; KEY_LEN]);
+    }
+
+    #[test]
+    fn different_aad_fails_to_decrypt() {
+        let key = [42u8; KEY_LEN];
+        let encrypted = encrypt(&key, b"hello vault", b"header v1").expect("encryption");
+        assert!(decrypt(&key, &encrypted, b"header v1").is_ok());
+        assert!(decrypt(&key, &encrypted, b"header v2").is_err());
     }
 }

@@ -1,6 +1,8 @@
 //! Integration tests: encrypted vault file round-trips.
 
 use argospass::crypto::VaultKey;
+use argospass::crypto::{KdfParams, SALT_LEN, derive_key, encrypt};
+use argospass::format::MAGIC;
 use argospass::{Entry, Vault};
 use std::fs;
 use std::path::PathBuf;
@@ -99,4 +101,43 @@ fn vault_file_is_readable_by_owner_only() {
     assert_eq!(mode & 0o777, 0o600);
 
     fs::remove_file(&path).expect("cleanup should succeed");
+}
+
+#[test]
+fn tampered_header_fails_to_open() {
+    let path = temp_vault("tampered-header");
+    let key = VaultKey::new("master").expect("key derivation should succeed");
+    Vault::new().save(&path, &key).expect("save should succeed");
+
+    let mut data = fs::read(&path).expect("read should succeed");
+    data[10] = 4; // iterations: 3 -> 4 (still within the accepted bounds)
+    fs::write(&path, &data).expect("write should succeed");
+
+    assert!(Vault::open(&path, "master").is_err());
+
+    fs::remove_file(&path).expect("cleanup should succeed");
+}
+
+#[test]
+fn legacy_vault_is_upgraded() {
+    let path = temp_vault("legacy");
+    let backup = path.with_extension("argos.bak");
+
+    // Build a vault in the pre-v1 layout: salt || nonce || ciphertext || tag.
+    let salt = [9u8; SALT_LEN];
+    let key = derive_key("master", &salt, &KdfParams::LEGACY).expect("derivation");
+    let encrypted = encrypt(&key, br#"{"entries":[]}"#, &[]).expect("encryption");
+    let mut legacy = salt.to_vec();
+    legacy.extend_from_slice(&encrypted);
+    fs::write(&path, &legacy).expect("write should succeed");
+
+    let (vault, _) = Vault::open(&path, "master").expect("legacy vault should open");
+    assert!(vault.list().is_empty());
+
+    let upgraded = fs::read(&path).expect("read should succeed");
+    assert!(upgraded.starts_with(MAGIC));
+    assert!(Vault::open(&path, "master").is_ok());
+
+    fs::remove_file(&path).expect("cleanup should succeed");
+    fs::remove_file(&backup).expect("cleanup should succeed");
 }
