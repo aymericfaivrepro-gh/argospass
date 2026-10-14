@@ -74,7 +74,8 @@ Logs go to **stderr**, so they never mix with a command's output. They only show
 | macOS | `~/Library/Application Support/argospass/vault.argos` |
 | Windows | `%APPDATA%\argospass\vault.argos` |
 
-The previous version of the vault is kept next to it as `vault.argos.bak`. After an automatic format upgrade (see [Vault file format](#vault-file-format)), the backup is the vault in its old format, which this version can still open.
+The previous version of the vault is kept next to it as `vault.argos.bak`.
+> ⚠️ ArgosPass is developed and tested on Linux (including WSL). Windows and macOS paths are given for reference; these platforms are not tested yet.
 
 ### Exit codes
 
