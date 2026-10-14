@@ -98,6 +98,12 @@ enum Command {
         /// Entry title
         title: String,
     },
+    /// Change the master password
+    Passwd {
+        /// Also generate a new data key (use it if the old password may have leaked)
+        #[arg(long)]
+        rotate_key: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -155,6 +161,7 @@ fn run() -> AppResult {
 
     match cli.command {
         Command::Init => init(&path),
+        Command::Passwd { rotate_key } => change_password(&path, rotate_key),
         Command::Generate { length, no_symbols } => {
             println!("{}", *generate_password(length, !no_symbols)?);
             Ok(())
@@ -185,8 +192,52 @@ fn init(path: &Path) -> AppResult {
     Ok(())
 }
 
-/// Unlocks the vault with the master password, then runs the command.
-fn execute(path: &Path, command: Command) -> AppResult {
+/// Changes the master password. With `rotate_key`, also replaces the data key.
+fn change_password(path: &Path, rotate_key: bool) -> AppResult {
+    require_vault(path)?;
+    let (vault, key) = unlock(path)?;
+
+    if rotate_key {
+        eprintln!("Choose the new master password (it may be the current one).");
+    } else {
+        eprintln!("Choose the new master password.");
+    }
+    let new_password = ask_new_password("New master password: ")?;
+
+    // Without a new data key, keeping the same password would change nothing.
+    // The current password is not kept in memory: a new password equal to it
+    // is recognized because it opens the current envelope.
+    if !rotate_key && key.opens_with(&new_password)? {
+        return Err("the new password must be different from the current one".into());
+    }
+
+    let new_key = if rotate_key {
+        info!("generating a new data key");
+        drop(key); // wipes the old data key now
+        VaultKey::new(&new_password)?
+    } else {
+        key.rewrap(&new_password)?
+    };
+    vault.save_and_replace_backup(path, &new_key)?;
+
+    if rotate_key {
+        // The password may be unchanged: do not claim it was changed.
+        println!("Master password set and data key replaced.");
+    } else {
+        println!("Master password changed.");
+    }
+    eprintln!(
+        "Copies of the vault made before this change (cloud history, other backups) \
+         still open with the old password."
+    );
+    if !rotate_key {
+        eprintln!("If the old password may have leaked, run `argospass passwd --rotate-key`.");
+    }
+    Ok(())
+}
+
+/// Fails with a helpful message if there is no vault at `path`.
+fn require_vault(path: &Path) -> AppResult {
     if !path.exists() {
         let message = format!(
             "no vault found at {}, run `argospass init` first",
@@ -194,11 +245,18 @@ fn execute(path: &Path, command: Command) -> AppResult {
         );
         return Err(message.into());
     }
+    Ok(())
+}
 
+/// Unlocks the vault with the master password, then runs the command.
+fn execute(path: &Path, command: Command) -> AppResult {
+    require_vault(path)?;
     let (mut vault, key) = unlock(path)?;
 
     match command {
-        Command::Init | Command::Generate { .. } => unreachable!("handled in run()"),
+        Command::Init | Command::Generate { .. } | Command::Passwd { .. } => {
+            unreachable!("handled in run()")
+        }
         Command::Add {
             title,
             username,

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// A vault entry: an account and its password.
@@ -215,6 +215,21 @@ impl Vault {
         write_atomic(path, &data)
     }
 
+    /// Saves the vault, then replaces the backup with the new version, so that
+    /// no file encrypted under the previous password is left next to the vault.
+    pub fn save_and_replace_backup(&self, path: &Path, key: &VaultKey) -> Result<()> {
+        self.save(path, key)?;
+
+        // `fs::copy` also copies the permission bits: the backup stays `600`.
+        let backup_path = sibling(path, ".bak");
+        fs::copy(path, &backup_path)?;
+        debug!(
+            "backup {} replaced with the new version",
+            backup_path.display()
+        );
+        Ok(())
+    }
+
     /// Serializes the vault to JSON in a buffer that is wiped on drop.
     fn to_json(&self) -> Result<Zeroizing<Vec<u8>>> {
         // Size the buffer exactly first: if it grew while serializing, each
@@ -250,14 +265,22 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Returns `path` with `suffix` appended to its full file name:
+/// `vault.argos` -> `vault.argos.bak`.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 /// Writes `data` to `path` without ever leaving a partially written file.
 ///
 /// The data is written to a temporary file, flushed to disk, then renamed over
 /// the destination. The previous version is kept as a `.bak` file.
 /// On Unix, the file is created with `600` permissions (owner read/write only).
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let tmp_path = path.with_extension("argos.tmp");
-    let backup_path = path.with_extension("argos.bak");
+    let tmp_path = sibling(path, ".tmp");
+    let backup_path = sibling(path, ".bak");
 
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -383,6 +406,18 @@ mod tests {
         let mut entry = Entry::new("Gmail", "me@gmail.com", "secret", None);
         entry.zeroize();
         assert!(entry.password.is_empty());
+    }
+
+    #[test]
+    fn sibling_appends_to_the_full_file_name() {
+        let cases = [
+            ("dir/vault.argos", "dir/vault.argos.bak"),
+            ("dir/secrets.db", "dir/secrets.db.bak"),
+            ("secrets", "secrets.bak"),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(sibling(Path::new(path), ".bak"), Path::new(expected));
+        }
     }
 
     #[test]

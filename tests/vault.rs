@@ -283,3 +283,81 @@ fn v1_vault_is_upgraded_to_v2() {
     fs::remove_file(&path).expect("cleanup should succeed");
     fs::remove_file(&backup).expect("cleanup should succeed");
 }
+
+/// Creates a vault protected by "old password" with one entry, and returns the
+/// paths of the vault and of its backup.
+fn vault_with_old_password(name: &str) -> (PathBuf, PathBuf) {
+    let path = temp_vault(name);
+    let backup = path.with_extension("argos.bak");
+    let key = VaultKey::new("old password").expect("key derivation should succeed");
+
+    let mut vault = Vault::new();
+    vault
+        .add(Entry::new("Gmail", "me@gmail.com", "secret", None))
+        .expect("add should succeed");
+    vault.save(&path, &key).expect("save should succeed");
+    (path, backup)
+}
+
+#[test]
+fn password_change() {
+    let (path, backup) = vault_with_old_password("passwd");
+
+    let (vault, key) = Vault::open(&path, "old password").expect("open should succeed");
+    let new_key = key.rewrap("new password").expect("rewrap should succeed");
+    vault
+        .save_and_replace_backup(&path, &new_key)
+        .expect("save should succeed");
+
+    let (opened, _) = Vault::open(&path, "new password").expect("new password should open");
+    let entry = opened.get("Gmail").expect("entry should exist");
+    assert_eq!(entry.password, "secret");
+    assert!(matches!(
+        Vault::open(&path, "old password"),
+        Err(Error::DecryptionFailed)
+    ));
+
+    // The backup no longer holds the vault under the old password.
+    assert!(matches!(
+        Vault::open(&backup, "old password"),
+        Err(Error::DecryptionFailed)
+    ));
+    assert!(Vault::open(&backup, "new password").is_ok());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&backup)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    fs::remove_file(&path).expect("cleanup should succeed");
+    fs::remove_file(&backup).expect("cleanup should succeed");
+}
+
+#[test]
+fn password_change_with_key_rotation() {
+    let (path, backup) = vault_with_old_password("passwd-rotate");
+
+    let (vault, _) = Vault::open(&path, "old password").expect("open should succeed");
+    let new_key = VaultKey::new("new password").expect("key derivation should succeed");
+    vault
+        .save_and_replace_backup(&path, &new_key)
+        .expect("save should succeed");
+
+    for file in [&path, &backup] {
+        let (opened, _) = Vault::open(file, "new password").expect("new password should open");
+        let entry = opened.get("Gmail").expect("entry should exist");
+        assert_eq!(entry.password, "secret");
+        assert!(matches!(
+            Vault::open(file, "old password"),
+            Err(Error::DecryptionFailed)
+        ));
+    }
+
+    fs::remove_file(&path).expect("cleanup should succeed");
+    fs::remove_file(&backup).expect("cleanup should succeed");
+}

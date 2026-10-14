@@ -155,11 +155,28 @@ impl VaultKey {
     /// Creates key material for a new vault: fresh salt, default parameters
     /// and a new random data key.
     pub fn new(password: &str) -> Result<Self> {
-        let header = Header {
-            params: KdfParams::DEFAULT,
-            salt: generate_salt()?,
-        };
-        Self::seal(password, header, DataKey::generate()?)
+        Self::seal(password, fresh_header()?, DataKey::generate()?)
+    }
+
+    /// Wraps the same data key under a new password, with a fresh salt and the
+    /// current default Argon2 parameters. The content key does not change.
+    pub fn rewrap(self, new_password: &str) -> Result<Self> {
+        info!("wrapping the data key under the new password");
+        // Moves the box: the data key bytes are not copied.
+        Self::seal(new_password, fresh_header()?, self.data_key)
+    }
+
+    /// Tells whether `password` opens the current envelope, that is, whether it
+    /// is the current master password. Costs one Argon2id derivation.
+    ///
+    /// Lets the caller compare a new password with the current one without
+    /// keeping the current one in memory.
+    pub fn opens_with(&self, password: &str) -> Result<bool> {
+        match Self::unlock(password, self.header, &self.envelope) {
+            Ok(_) => Ok(true), // this second copy of the data key is wiped here
+            Err(Error::DecryptionFailed) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Opens the envelope of an existing vault with the master password.
@@ -215,6 +232,14 @@ impl VaultKey {
     pub(crate) fn decrypt(&self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         decrypt(&self.data_key.0, data, &self.prefix())
     }
+}
+
+/// Header for a new KEK: fresh random salt and the default Argon2id parameters.
+fn fresh_header() -> Result<Header> {
+    Ok(Header {
+        params: KdfParams::DEFAULT,
+        salt: generate_salt()?,
+    })
 }
 
 /// Generates a random salt using the operating system's CSPRNG.
@@ -482,6 +507,30 @@ mod tests {
         let a = VaultKey::new("correct horse").expect("key creation");
         let b = VaultKey::new("correct horse").expect("key creation");
         assert!(**a.data_key.0 != **b.data_key.0);
+    }
+
+    #[test]
+    fn rewrap_keeps_data_key_but_changes_salt_and_envelope() {
+        let key = VaultKey::new("old password").expect("key creation");
+        let old_salt = key.header.salt;
+        let old_envelope = key.envelope;
+        let old_data_key = Zeroizing::new(**key.data_key.0);
+
+        let key = key.rewrap("new password").expect("rewrap");
+        assert_ne!(key.header.salt, old_salt);
+        assert_ne!(key.envelope, old_envelope);
+        assert!(**key.data_key.0 == *old_data_key);
+    }
+
+    #[test]
+    fn opens_with_recognizes_the_current_password_only() {
+        let key = VaultKey::new("old password").expect("key creation");
+        assert!(key.opens_with("old password").expect("derivation"));
+        assert!(!key.opens_with("new password").expect("derivation"));
+
+        let key = key.rewrap("new password").expect("rewrap");
+        assert!(key.opens_with("new password").expect("derivation"));
+        assert!(!key.opens_with("old password").expect("derivation"));
     }
 
     #[test]

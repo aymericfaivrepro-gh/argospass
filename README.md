@@ -37,6 +37,7 @@ argospass get GitHub                                  # copy the password to the
 argospass get GitHub --show                           # print the password in the terminal instead
 argospass remove GitHub                               # remove an entry
 argospass generate                                    # print a random password (no vault needed)
+argospass passwd                                      # change the master password
 argospass --help                                      # full help (also: argospass <command> --help)
 ```
 
@@ -50,6 +51,7 @@ argospass --help                                      # full help (also: argospa
 | `get <TITLE>` | Copy the entry's password to the clipboard and clear it after 20 seconds. `--show` prints it instead. | Yes |
 | `remove <TITLE>` | Delete an entry | Yes |
 | `generate` | Print a random password: 24 characters by default (minimum 8), symbols included unless `--no-symbols` is given | No |
+| `passwd [--rotate-key]` | Change the master password. `--rotate-key` also generates a new data key. Without `--rotate-key`, the new password must differ from the current one. See [Changing the master password](#changing-the-master-password). | Yes, then chooses the new one |
 
 You get **3 attempts** to type the master password.
 
@@ -74,7 +76,10 @@ Logs go to **stderr**, so they never mix with a command's output. They only show
 | macOS | `~/Library/Application Support/argospass/vault.argos` |
 | Windows | `%APPDATA%\argospass\vault.argos` |
 
-The previous version of the vault is kept next to it as `vault.argos.bak`.
+The previous version of the vault is kept next to it, under the vault's file name followed by `.bak` (`vault.argos.bak`). After `passwd`, the backup is replaced by the new version, so that no file encrypted under the old password is left next to the vault.
+
+Earlier versions of ArgosPass named the backup of a vault whose name does not end in `.argos` after the name without its extension (`secrets.argos.bak` for `secrets.db`). ArgosPass no longer writes or replaces that file: delete it yourself, it may still open with an old password.
+
 > ⚠️ ArgosPass is developed and tested on Linux (including WSL). Windows and macOS paths are given for reference; these platforms are not tested yet.
 
 ### Exit codes
@@ -165,13 +170,25 @@ payload ─────────────────► XChaCha20-Poly130
 3. The JSON is encrypted with the data key, with the header and the envelope as associated data.
 4. The file (`header ‖ envelope ‖ new payload`) is written atomically (see [Atomic writes](#atomic-writes)).
 
-Saving needs neither the master password nor Argon2id: the data key is kept in memory while the command runs, and the header and the envelope are written back unchanged. The salt, the parameters and the data key stay the same for the vault's lifetime.
+Saving needs neither the master password nor Argon2id: the data key is kept in memory while the command runs, and the header and the envelope are written back unchanged. The salt and the parameters only change with the master password, and the data key only with `passwd --rotate-key`.
+
+### Changing the master password
+
+1. `passwd` unlocks the vault with the current password, then asks for the new one twice.
+2. Without `--rotate-key`, a new password identical to the current one is refused: keeping both the password and the data key would bring no security. The current password is not kept in memory for this: ArgosPass tries the new password on the current envelope, which costs one more Argon2id run. With `--rotate-key`, the same password is accepted.
+3. A new KEK is derived from the new password, with a **new salt** and the current default Argon2 parameters.
+4. The same data key is wrapped with the new KEK. With `--rotate-key`, a new random data key is generated instead.
+5. The vault is saved, then the `.bak` backup is replaced by the new version.
+
+**Plain `passwd` or `--rotate-key`?** A plain `passwd` keeps the data key. Someone who already got the data key, from a copy of the vault made before the change and the old password, can still decrypt every later version of the vault, whatever the new password. Only `--rotate-key` revokes them: the entries are then encrypted with a new key, and an old copy only reveals the entries as they were when it was made. Use `--rotate-key` if the old password may have leaked.
+
+`--rotate-key` also accepts the current password as the new one, to replace only the data key, for example if the data key alone may have been exposed. This does not help if the password itself may have leaked: whoever knows it can open the new vault too. Choose a new password in that case.
 
 ### Why these choices
 
 - **Argon2id** is memory-hard: each guess needs a large block of memory, which makes GPU and ASIC attacks much more expensive than with PBKDF2 or bcrypt. The `id` variant combines resistance to side channels and to GPU attacks. It won the Password Hashing Competition and is the RFC 9106 recommendation.
 - **XChaCha20-Poly1305** is an AEAD: it encrypts **and** authenticates in a single operation, so tampering is always detected. Its 192-bit nonce is large enough to be drawn at random on every save with no realistic risk of collision. ChaCha20 is also fast and constant-time in software, without needing AES hardware instructions.
-- **Envelope encryption** keeps the password-derived key away from the data: the KEK only ever encrypts 32 random bytes, and the entries are encrypted with a key that does not depend on the password at all. It also prepares master-password changes: the data key will stay the same and only need to be wrapped again with the new KEK. The payload will still be re-encrypted, as on every save, since its associated data includes the header and the envelope.
+- **Envelope encryption** keeps the password-derived key away from the data: the KEK only ever encrypts 32 random bytes, and the entries are encrypted with a key that does not depend on the password at all. It also makes master-password changes simple: `passwd` wraps the same data key again with the new KEK. The payload is still re-encrypted, as on every save, since its associated data includes the header and the envelope.
 - **256-bit keys** keep a comfortable margin, including against quantum attacks on symmetric cryptography (Grover's algorithm only halves the effective strength).
 
 ### Argon2id parameters
@@ -260,6 +277,7 @@ This plaintext only ever exists in memory. It is never written to disk.
 vault.argos.tmp  ← 1. write the new content (permissions 600), then fsync to force it onto the disk
 vault.argos.bak  ← 2. copy of the current vault
 vault.argos      ← 3. atomic rename of .tmp over the vault
+vault.argos.bak  ← 4. passwd only: replaced by a copy of the new vault
 ```
 
 The rename is atomic: at any moment, `vault.argos` is either the complete old version or the complete new one, never a half-written file.
@@ -278,7 +296,7 @@ When freed, memory is not erased: secrets could remain in RAM, then end up in a 
 | Decrypted JSON | `Zeroizing<Vec<u8>>` |
 | JSON before encryption | Exact size computed first, so the buffer never reallocates and leaves no unwiped copies behind |
 | Entries | `Entry` implements `ZeroizeOnDrop`: every field is wiped when the entry is dropped |
-| Master password, generated passwords, clipboard read-back | `Zeroizing<String>` |
+| Master passwords (current and new), generated passwords, clipboard read-back | `Zeroizing<String>`. The current password is wiped as soon as the vault is unlocked, even by `passwd` |
 
 ## Known limitations
 
@@ -287,7 +305,7 @@ When freed, memory is not erased: secrets could remain in RAM, then end up in a 
 - **Ctrl+C during `get`:** interrupting the 20-second countdown leaves the password in the clipboard.
 - **Whole vault decrypted at once:** every entry is in clear in memory while a command runs, not only the one you asked for.
 - **No rollback protection** and **file size not hidden** (see [Security model](#security-model)).
-- **The master password cannot be changed yet.**
+- **Old copies keep the old password:** copies of the vault made before a password change (cloud history, backups, other computers) still open with the old password.
 
 ## Development
 
@@ -326,7 +344,8 @@ Unit tests live next to the code they test. Integration tests in `tests/vault.rs
 - the file has `600` permissions (Unix only);
 - new vaults use format v2 (160 bytes when empty);
 - a modified header or envelope is rejected;
-- v1 and legacy vaults are upgraded to the current format.
+- v1 and legacy vaults are upgraded to the current format;
+- after a password change (with or without `--rotate-key`), the vault and its backup open with the new password only, and the backup keeps `600` permissions.
 
 During development, always use a test vault (`--vault /tmp/...`), never your real one. Vault files (`*.argos`, `*.argos.*`) are ignored by Git.
 
