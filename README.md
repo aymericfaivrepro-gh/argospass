@@ -1,6 +1,6 @@
 # ArgosPass
 
-A command-line password manager written in Rust. Entries live in a single local file, encrypted with a key derived from your master password.
+A command-line password manager written in Rust. Entries live in a single local file, encrypted with a random key that only your master password can unlock.
 
 > ⚠️ **Personal learning project.** ArgosPass is still in development and it has not been audited by a third party. Use it at your own risk and keep backups of your vault.
 
@@ -62,7 +62,7 @@ The clipboard is only cleared if it still contains the password ArgosPass put th
 | `--vault <PATH>` | Use another vault file |
 | `ARGOSPASS_VAULT=<PATH>` | Same, through an environment variable |
 | `-v` | Show the main steps (key derivation time, file read/written…) |
-| `-vv` | Show every detail (sizes, salt, nonce, Argon2 parameters, generator statistics…) |
+| `-vv` | Show every detail (sizes, salt, nonces, tags, Argon2 parameters, generator statistics…) |
 
 Logs go to **stderr**, so they never mix with a command's output. They only show public values. The master password, keys, decrypted content and entry passwords are never logged.
 
@@ -74,7 +74,7 @@ Logs go to **stderr**, so they never mix with a command's output. They only show
 | macOS | `~/Library/Application Support/argospass/vault.argos` |
 | Windows | `%APPDATA%\argospass\vault.argos` |
 
-The previous version of the vault is kept next to it as `vault.argos.bak`.
+The previous version of the vault is kept next to it as `vault.argos.bak`. After an automatic format upgrade (see [Vault file format](#vault-file-format)), the backup is the vault in its old format, which this version can still open.
 
 ### Exit codes
 
@@ -96,7 +96,7 @@ The previous version of the vault is kept next to it as `vault.argos.bak`.
 | Threat | Protection |
 | --- | --- |
 | **Theft of the vault file** (lost laptop, leaked cloud copy, backup) | Content is encrypted. An attacker must guess the master password, and each guess costs a full Argon2id derivation: tens of megabytes of memory and a noticeable delay. |
-| **Modification of the vault file** | Every byte is authenticated: the content by the Poly1305 tag, the header as associated data. Any change makes opening fail. |
+| **Modification of the vault file** | Every byte is authenticated: the envelope and the content by their Poly1305 tags, the header and the envelope as associated data. Any change makes opening fail. |
 | **Downgrade of the key derivation** (an attacker lowers the Argon2 parameters in the header to speed up guessing) | Parameters are authenticated, and values below a security floor are refused before any derivation. |
 | **Absurd parameters in a crafted file** (memory exhaustion) | Values above an upper limit are refused. |
 | **Crash or power loss during a save** | Atomic write: the old vault stays intact until the new one is fully on disk, and a `.bak` copy is kept. |
@@ -119,39 +119,58 @@ Only audited, widely used implementations from the [RustCrypto](https://github.c
 | Role | Algorithm | Crate |
 | --- | --- | --- |
 | Key derivation from the master password | **Argon2id** (RFC 9106), version 0x13 | `argon2` |
-| Authenticated encryption | **XChaCha20-Poly1305** (AEAD) | `chacha20poly1305` |
-| Randomness (salt, nonce, generated passwords) | Operating system CSPRNG | `getrandom` |
+| Authenticated encryption (of the data key and of the entries) | **XChaCha20-Poly1305** (AEAD) | `chacha20poly1305` |
+| Randomness (salt, nonces, data key, generated passwords) | Operating system CSPRNG | `getrandom` |
 | Memory wiping | Volatile writes that the compiler cannot optimize away | `zeroize` |
+
+### Two keys: envelope encryption
+
+ArgosPass uses two 256-bit keys:
+
+- the **key-encryption key (KEK)** is derived from the master password with Argon2id. Its only job is to encrypt the data key;
+- the **data key** is drawn at random when the vault is created and never changes. It encrypts the entries.
+
+The data key, encrypted with the KEK, is stored in the file: this is the **envelope**.
 
 ### How a vault is opened
 
 ```
 master password ─┐
-salt (header) ───┼──► Argon2id ──► 256-bit key ─┐
-parameters ──────┘   (header)                   │
-                                                ▼
-header (as AAD) ──────────────────►  XChaCha20-Poly1305  ──►  JSON entries
-nonce ‖ ciphertext ‖ tag ─────────►  decrypt + verify tag
+salt (header) ───┼──► Argon2id ──► KEK
+parameters ──────┘                  │
+                                    ▼
+envelope ────────────────► XChaCha20-Poly1305 ◄── AAD: header
+                                    │  verify tag, decrypt
+                                    ▼
+                                data key
+                                    │
+                                    ▼
+payload ─────────────────► XChaCha20-Poly1305 ◄── AAD: header ‖ envelope
+                                    │  verify tag, decrypt
+                                    ▼
+                              JSON entries
 ```
 
-1. ArgosPass reads the header and checks the magic bytes, the format version and the Argon2 parameters.
-2. The master password and the salt go through Argon2id with the parameters from the header. The output is a 256-bit key.
-3. XChaCha20-Poly1305 checks the authentication tag over the ciphertext **and the header**, then decrypts.
-4. If the tag does not match (wrong password, modified file), nothing is decrypted, and the error does not say which of the two happened.
+1. ArgosPass reads the header and checks the magic bytes, the format version, the Argon2 parameters and the file length, all before any key derivation.
+2. The master password and the salt go through Argon2id with the parameters from the header. The output is the KEK.
+3. The KEK opens the envelope: XChaCha20-Poly1305 checks the envelope's tag over the encrypted data key **and the header**, then decrypts the data key. The KEK is wiped right away.
+4. The data key decrypts the payload. Its tag covers the ciphertext **and everything before it** (header and envelope).
+5. If a tag does not match (wrong password, modified file), nothing is decrypted, and the error does not say which of the two happened.
 
 ### How a vault is saved
 
 1. The entries are serialized to JSON into a buffer that will be wiped afterwards.
-2. A new random 24-byte nonce is generated. **Every save uses a fresh nonce**, so the file changes completely even when its content does not.
-3. The JSON is encrypted with the header as associated data.
-4. The file is written atomically (see [Atomic writes](#atomic-writes)).
+2. A new random 24-byte nonce is generated. **Every save uses a fresh nonce**, so the payload changes completely even when its content does not.
+3. The JSON is encrypted with the data key, with the header and the envelope as associated data.
+4. The file (`header ‖ envelope ‖ new payload`) is written atomically (see [Atomic writes](#atomic-writes)).
 
-The key is derived once, when the vault is unlocked, and reused for the save. The salt and parameters stay the same for the vault's lifetime.
+Saving needs neither the master password nor Argon2id: the data key is kept in memory while the command runs, and the header and the envelope are written back unchanged. The salt, the parameters and the data key stay the same for the vault's lifetime.
 
 ### Why these choices
 
 - **Argon2id** is memory-hard: each guess needs a large block of memory, which makes GPU and ASIC attacks much more expensive than with PBKDF2 or bcrypt. The `id` variant combines resistance to side channels and to GPU attacks. It won the Password Hashing Competition and is the RFC 9106 recommendation.
 - **XChaCha20-Poly1305** is an AEAD: it encrypts **and** authenticates in a single operation, so tampering is always detected. Its 192-bit nonce is large enough to be drawn at random on every save with no realistic risk of collision. ChaCha20 is also fast and constant-time in software, without needing AES hardware instructions.
+- **Envelope encryption** keeps the password-derived key away from the data: the KEK only ever encrypts 32 random bytes, and the entries are encrypted with a key that does not depend on the password at all. It also prepares master-password changes: the data key will stay the same and only need to be wrapped again with the new KEK. The payload will still be re-encrypted, as on every save, since its associated data includes the header and the envelope.
 - **256-bit keys** keep a comfortable margin, including against quantum attacks on symmetric cryptography (Grover's algorithm only halves the effective strength).
 
 ### Argon2id parameters
@@ -184,27 +203,36 @@ Each character is chosen with **rejection sampling**: random bytes that would ma
 
 ## Vault file format
 
-### Version 1 (current)
+### Version 2 (current)
 
-| Offset | Size | Field |
-| --- | --- | --- |
-| 0 | 5 | Magic bytes `ARGOS`, to recognize the file |
-| 5 | 1 | Format version (`1`) |
-| 6 | 4 | Argon2 memory in KiB (little-endian) |
-| 10 | 4 | Argon2 iterations (little-endian) |
-| 14 | 4 | Argon2 parallelism (little-endian) |
-| 18 | 16 | Random salt |
-| 34 | 24 | Random nonce |
-| 58 | n | Encrypted JSON |
-| 58 + n | 16 | Poly1305 authentication tag |
+| Offset | Size | Part | Field |
+| --- | --- | --- | --- |
+| 0 | 5 | Header | Magic bytes `ARGOS`, to recognize the file |
+| 5 | 1 | Header | Format version (`2`) |
+| 6 | 4 | Header | Argon2 memory in KiB (little-endian) |
+| 10 | 4 | Header | Argon2 iterations (little-endian) |
+| 14 | 4 | Header | Argon2 parallelism (little-endian) |
+| 18 | 16 | Header | Random salt |
+| 34 | 24 | Envelope | Random nonce |
+| 58 | 32 | Envelope | Data key, encrypted with the KEK |
+| 90 | 16 | Envelope | Poly1305 authentication tag |
+| 106 | 24 | Payload | Random nonce |
+| 130 | n | Payload | Encrypted JSON |
+| 130 + n | 16 | Payload | Poly1305 authentication tag |
 
-The first 34 bytes form the header. It is stored **in clear**, since it is needed to derive the key, but it is **authenticated**: changing a single bit makes opening fail. An empty vault takes 88 bytes.
+The header (34 bytes) and the envelope (72 bytes) are stored **in clear**, since they are needed to unlock the vault, but they are **authenticated**: the header is the associated data of the envelope, and the header and the envelope together are the associated data of the payload. Changing a single bit anywhere makes opening fail. An empty vault takes 160 bytes.
 
-The salt and the nonce are not secret. Their job is to be unique: the salt makes each vault's key different even with the same password (and rules out precomputed tables), and the nonce makes each encryption different.
+The salt and the nonces are not secret. Their job is to be unique: the salt makes each vault's KEK different even with the same password (and rules out precomputed tables), and the nonces make each encryption different.
+
+### Version 1 (legacy)
+
+Version 1 had the same header (with version `1`), followed directly by `nonce (24) ‖ encrypted JSON ‖ tag (16)`: the entries were encrypted with the key derived from the master password, with the header as associated data. An empty vault took 88 bytes.
+
+These files are still opened, then **automatically re-saved in version 2** with a new salt, the current Argon2 parameters and a new random data key (the old derived key is never reused). A warning is shown when this happens, only after the vault was decrypted successfully. The version 1 file is kept as the `.bak` backup.
 
 ### Legacy format (version 0)
 
-The first versions of ArgosPass wrote `salt (16) ‖ nonce (24) ‖ ciphertext ‖ tag (16)`, with no header and no associated data. These files are still recognized (no magic bytes), opened with the default parameters of the time, and **automatically re-saved in version 1**. A warning is shown when this happens.
+The first versions of ArgosPass wrote `salt (16) ‖ nonce (24) ‖ ciphertext ‖ tag (16)`, with no header and no associated data. These files are still recognized (no magic bytes), opened with the default parameters of the time, and **automatically re-saved in the current version**, like version 1 files. A warning is shown when this happens.
 
 ### Decrypted content
 
@@ -241,7 +269,10 @@ When freed, memory is not erased: secrets could remain in RAM, then end up in a 
 
 | Secret | Protection |
 | --- | --- |
-| Derived key | `Box<Zeroizing<[u8; 32]>>`: stored once on the heap (never copied around the stack) and wiped on drop |
+| Key-encryption key (KEK) | `Box<Zeroizing<[u8; 32]>>`: stored once on the heap (never copied around the stack). Wiped right after opening (or creating) the envelope, so it is never kept while the vault is open |
+| Data key | `Box<Zeroizing<[u8; 32]>>`: drawn at random directly into a zeroed heap buffer, or decrypted into a `Zeroizing<Vec<u8>>` and copied into one, so it never touches the stack. Kept while the command runs (saving needs it) and wiped on drop |
+| Keys of the old formats (v1, legacy) | Wiped right after decrypting the old file, before the upgrade |
+| Key copy inside the cipher | Each XChaCha20-Poly1305 instance keeps its own copy of the key. It only lives for one encryption or decryption, and the `chacha20poly1305` crate wipes it on drop |
 | Argon2 working memory (128 MiB by default) | Allocated by ArgosPass in a `Zeroizing` buffer and wiped after the derivation. The `argon2` crate would otherwise free it without wiping it. |
 | Decrypted JSON | `Zeroizing<Vec<u8>>` |
 | JSON before encryption | Exact size computed first, so the buffer never reallocates and leaves no unwiped copies behind |
@@ -260,11 +291,11 @@ When freed, memory is not erased: secrets could remain in RAM, then end up in a 
 ## Development
 
 ```bash
-cargo build                                   # build
-cargo test                                    # unit and integration tests
-cargo fmt --all                               # format
-cargo clippy --all-targets -- -D warnings     # lint (warnings are errors)
-cargo audit                                   # check dependencies against RustSec (cargo install cargo-audit)
+cargo build                                         # build
+cargo test --locked                                 # unit and integration tests
+cargo fmt --all                                     # format
+cargo clippy --all-targets --locked -- -D warnings  # lint (warnings are errors)
+cargo audit                                         # check dependencies against RustSec (cargo install cargo-audit)
 ```
 
 The CI (`.github/workflows/ci.yml`) runs the same checks on every push.
@@ -275,8 +306,8 @@ The CI (`.github/workflows/ci.yml`) runs the same checks on every push.
 src/
 ├── main.rs        command-line interface (clap), prompts, clipboard, exit codes
 ├── lib.rs         Entry, Vault, open/save, atomic writes
-├── crypto.rs      Argon2id derivation, XChaCha20-Poly1305 encryption, KdfParams, VaultKey
-├── format.rs      vault header: serialization, parsing, validation
+├── crypto.rs      Argon2id derivation, envelope encryption (KEK, data key), XChaCha20-Poly1305, KdfParams, VaultKey
+├── format.rs      vault header: serialization, parsing, validation, format versions
 ├── generator.rs   password generator
 └── error.rs       error type
 tests/
@@ -292,8 +323,9 @@ Unit tests live next to the code they test. Integration tests in `tests/vault.rs
 - no secret appears in clear in the file;
 - the backup is kept and no temporary file is left behind;
 - the file has `600` permissions (Unix only);
-- a modified header is rejected;
-- a legacy vault is upgraded to the current format.
+- new vaults use format v2 (160 bytes when empty);
+- a modified header or envelope is rejected;
+- v1 and legacy vaults are upgraded to the current format.
 
 During development, always use a test vault (`--vault /tmp/...`), never your real one. Vault files (`*.argos`, `*.argos.*`) are ignored by Git.
 

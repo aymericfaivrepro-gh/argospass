@@ -211,3 +211,75 @@ fn legacy_vault_is_upgraded() {
     fs::remove_file(&path).expect("cleanup should succeed");
     fs::remove_file(&backup).expect("cleanup should succeed");
 }
+
+#[test]
+fn new_vault_uses_format_v2() {
+    let path = temp_vault("format-v2");
+    let key = VaultKey::new("master").expect("key derivation should succeed");
+    Vault::new().save(&path, &key).expect("save should succeed");
+
+    let data = fs::read(&path).expect("read should succeed");
+    assert_eq!(data[5], 2);
+    // header 34 + envelope 72 + nonce 24 + `{"entries":[]}` 14 + tag 16
+    assert_eq!(data.len(), 160);
+
+    fs::remove_file(&path).expect("cleanup should succeed");
+}
+
+#[test]
+fn tampered_envelope_is_rejected() {
+    let path = temp_vault("tampered-envelope");
+    let key = VaultKey::new("master").expect("key derivation should succeed");
+    Vault::new().save(&path, &key).expect("save should succeed");
+
+    let mut data = fs::read(&path).expect("read should succeed");
+    data[HEADER_LEN + 30] ^= 0x01; // flip one bit of the encrypted data key
+    fs::write(&path, &data).expect("write should succeed");
+
+    assert!(matches!(
+        Vault::open(&path, "master"),
+        Err(Error::DecryptionFailed)
+    ));
+
+    fs::remove_file(&path).expect("cleanup should succeed");
+}
+
+#[test]
+fn v1_vault_is_upgraded_to_v2() {
+    let path = temp_vault("v1-upgrade");
+    let backup = path.with_extension("argos.bak");
+
+    // Build a vault in format v1: header || nonce || ciphertext || tag,
+    // encrypted with the Argon2id key itself and the header as AAD.
+    let salt = [7u8; SALT_LEN];
+    let mut v1 = MAGIC.to_vec();
+    v1.push(1);
+    v1.extend_from_slice(&(64 * 1024u32).to_le_bytes());
+    v1.extend_from_slice(&3u32.to_le_bytes());
+    v1.extend_from_slice(&1u32.to_le_bytes());
+    v1.extend_from_slice(&salt);
+    assert_eq!(v1.len(), HEADER_LEN);
+
+    let key = derive_key("master", &salt, &KdfParams::MINIMUM).expect("derivation");
+    let encrypted = encrypt(&key, br#"{"entries":[]}"#, &v1).expect("encryption");
+    v1.extend_from_slice(&encrypted);
+    fs::write(&path, &v1).expect("write should succeed");
+
+    // A wrong password must not upgrade (nor touch) the file.
+    assert!(matches!(
+        Vault::open(&path, "not the master"),
+        Err(Error::DecryptionFailed)
+    ));
+    assert_eq!(fs::read(&path).expect("read should succeed"), v1);
+
+    let (vault, _) = Vault::open(&path, "master").expect("v1 vault should open");
+    assert!(vault.list().is_empty());
+
+    let upgraded = fs::read(&path).expect("read should succeed");
+    assert!(upgraded.starts_with(MAGIC));
+    assert_eq!(upgraded[5], 2);
+    assert!(Vault::open(&path, "master").is_ok());
+
+    fs::remove_file(&path).expect("cleanup should succeed");
+    fs::remove_file(&backup).expect("cleanup should succeed");
+}

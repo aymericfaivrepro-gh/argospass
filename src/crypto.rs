@@ -1,6 +1,7 @@
-//! Cryptography: deriving a key from the master password.
+//! Cryptography: deriving a key from the master password, envelope encryption
+//! and authenticated encryption of the vault.
 
-use crate::format::Header;
+use crate::format::{HEADER_LEN, Header};
 use crate::{Error, Result, to_hex};
 use argon2::{Algorithm, Argon2, Block, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -20,6 +21,9 @@ pub const NONCE_LEN: usize = 24;
 
 /// Poly1305 authentication tag length: 16 bytes.
 pub const TAG_LEN: usize = 16;
+
+/// Length of the envelope (the data key wrapped by the KEK): 72 bytes.
+pub const ENVELOPE_LEN: usize = NONCE_LEN + KEY_LEN + TAG_LEN;
 
 /// Argon2id cost parameters, stored in the vault header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,31 +82,141 @@ impl KdfParams {
     }
 }
 
-/// Key material of an unlocked vault: its header (salt and Argon2id parameters)
-/// and the key derived from the master password.
+/// A 256-bit secret key. Boxed so that moving it around only copies a pointer,
+/// never the key bytes themselves, and wiped on drop.
+type SecretKey = Box<Zeroizing<[u8; KEY_LEN]>>;
+
+/// Key-encryption key (KEK): derived from the master password with Argon2id.
+///
+/// Only used to wrap and unwrap the [`DataKey`], never to encrypt the entries.
+struct Kek(SecretKey);
+
+impl Kek {
+    /// Derives the KEK from the master password and the salt and parameters
+    /// of `header`.
+    fn derive(password: &str, header: &Header) -> Result<Self> {
+        derive_key(password, &header.salt, &header.params).map(Self)
+    }
+
+    /// Encrypts `data_key` into an envelope:
+    /// `nonce (24 bytes) || encrypted data key (32 bytes) || tag (16 bytes)`.
+    fn wrap_key(&self, data_key: &DataKey, aad: &[u8]) -> Result<[u8; ENVELOPE_LEN]> {
+        let envelope = encrypt(&self.0, &**data_key.0, aad)?;
+        envelope.try_into().map_err(|_| Error::EncryptionFailed)
+    }
+
+    /// Decrypts the data key from an envelope produced by [`Kek::wrap_key`].
+    ///
+    /// Fails with [`Error::DecryptionFailed`] if the KEK is wrong (wrong master
+    /// password) or if the envelope or `aad` has been modified.
+    fn unwrap_key(&self, envelope: &[u8], aad: &[u8]) -> Result<DataKey> {
+        let bytes = decrypt(&self.0, envelope, aad)?;
+        if bytes.len() != KEY_LEN {
+            return Err(Error::DecryptionFailed);
+        }
+
+        // Allocated (zeroed) on the heap first, then filled in place: the key
+        // bytes are never copied to the stack.
+        let mut key = Box::new(Zeroizing::new([0u8; KEY_LEN]));
+        key.copy_from_slice(&bytes);
+        Ok(DataKey(key))
+    }
+}
+
+/// Data key: random, generated once when the vault is created, and used to
+/// encrypt the entries. Stored in the file wrapped by the [`Kek`].
+pub(crate) struct DataKey(SecretKey);
+
+impl DataKey {
+    /// Generates a new random data key using the operating system's CSPRNG.
+    fn generate() -> Result<Self> {
+        // Filled in place on the heap: the key bytes never touch the stack.
+        let mut key = Box::new(Zeroizing::new([0u8; KEY_LEN]));
+        getrandom::fill(&mut **key)?;
+        debug!("generated a new random data key ({KEY_LEN} bytes)");
+        Ok(Self(key))
+    }
+}
+
+/// Key material of an unlocked vault (envelope encryption).
+///
+/// The master password goes through Argon2id to give the `Kek`, which only
+/// unwraps the `DataKey` stored in the envelope. The data key encrypts the
+/// entries. The KEK is wiped as soon as the envelope is opened.
 pub struct VaultKey {
+    /// Salt and Argon2id parameters of the KEK.
     pub(crate) header: Header,
-    /// Boxed so that moving `VaultKey` around only copies a pointer,
-    /// never the key bytes themselves.
-    pub(crate) key: Box<Zeroizing<[u8; KEY_LEN]>>,
+    /// The data key, wrapped by the KEK. Public: written as is on every save.
+    envelope: [u8; ENVELOPE_LEN],
+    data_key: DataKey,
 }
 
 impl VaultKey {
-    /// Creates key material for a new vault: fresh salt, default parameters.
+    /// Creates key material for a new vault: fresh salt, default parameters
+    /// and a new random data key.
     pub fn new(password: &str) -> Result<Self> {
         let header = Header {
             params: KdfParams::DEFAULT,
             salt: generate_salt()?,
         };
-        Self::from_header(password, header)
+        Self::seal(password, header, DataKey::generate()?)
     }
 
-    /// Re-derives the key of an existing vault from its header.
-    pub fn from_header(password: &str, header: Header) -> Result<Self> {
-        let key = derive_key(password, &header.salt, &header.params)?;
-        Ok(Self { header, key })
+    /// Opens the envelope of an existing vault with the master password.
+    ///
+    /// Fails with [`Error::DecryptionFailed`] if the password is wrong or if the
+    /// header or the envelope has been modified.
+    pub(crate) fn unlock(password: &str, header: Header, envelope: &[u8]) -> Result<Self> {
+        // Checked before running Argon2id: a malformed file must fail fast.
+        let envelope: [u8; ENVELOPE_LEN] = envelope.try_into().map_err(|_| Error::Truncated)?;
+
+        let data_key = {
+            let kek = Kek::derive(password, &header)?;
+            kek.unwrap_key(&envelope, &header.to_bytes())?
+        }; // the KEK is wiped here
+        info!("envelope opened");
+
+        Ok(Self {
+            header,
+            envelope,
+            data_key,
+        })
+    }
+
+    /// Wraps `data_key` with the KEK derived from `password` and `header`.
+    fn seal(password: &str, header: Header, data_key: DataKey) -> Result<Self> {
+        let envelope = {
+            let kek = Kek::derive(password, &header)?;
+            kek.wrap_key(&data_key, &header.to_bytes())?
+        }; // the KEK is wiped here
+
+        Ok(Self {
+            header,
+            envelope,
+            data_key,
+        })
+    }
+
+    /// Everything written before the payload: `header || envelope`.
+    pub(crate) fn prefix(&self) -> Vec<u8> {
+        let mut prefix = Vec::with_capacity(HEADER_LEN + ENVELOPE_LEN);
+        prefix.extend_from_slice(&self.header.to_bytes());
+        prefix.extend_from_slice(&self.envelope);
+        prefix
+    }
+
+    /// Encrypts the vault content with the data key.
+    /// The header and the envelope are authenticated as associated data.
+    pub(crate) fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        encrypt(&self.data_key.0, plaintext, &self.prefix())
+    }
+
+    /// Decrypts a payload produced by [`VaultKey::encrypt`].
+    pub(crate) fn decrypt(&self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        decrypt(&self.data_key.0, data, &self.prefix())
     }
 }
+
 /// Generates a random salt using the operating system's CSPRNG.
 pub fn generate_salt() -> Result<[u8; SALT_LEN]> {
     let mut salt = [0u8; SALT_LEN];
@@ -343,6 +457,31 @@ mod tests {
         let mut key = Zeroizing::new([42u8; KEY_LEN]);
         key.zeroize();
         assert_eq!(*key, [0u8; KEY_LEN]);
+    }
+
+    #[test]
+    fn envelope_round_trip_and_aad() {
+        let kek = Kek(Box::new(Zeroizing::new([1u8; KEY_LEN])));
+        let data_key = DataKey::generate().expect("generation");
+
+        let envelope = kek.wrap_key(&data_key, b"header").expect("wrap");
+        assert_eq!(envelope.len(), ENVELOPE_LEN);
+
+        let unwrapped = kek.unwrap_key(&envelope, b"header").expect("unwrap");
+        // `assert!` rather than `assert_eq!`: a failure must not print key bytes.
+        assert!(**unwrapped.0 == **data_key.0);
+
+        assert!(matches!(
+            kek.unwrap_key(&envelope, b"other header"),
+            Err(Error::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn two_vaults_get_different_data_keys() {
+        let a = VaultKey::new("correct horse").expect("key creation");
+        let b = VaultKey::new("correct horse").expect("key creation");
+        assert!(**a.data_key.0 != **b.data_key.0);
     }
 
     #[test]

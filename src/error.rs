@@ -1,7 +1,7 @@
 //! Errors returned by the ArgosPass library.
 
 use crate::crypto::KdfParams;
-use crate::format::FORMAT_VERSION;
+use crate::format::{FORMAT_VERSION, OLDEST_SUPPORTED_VERSION};
 use crate::generator::MIN_LENGTH;
 use std::io;
 
@@ -21,7 +21,10 @@ pub enum Error {
     BadMagic,
 
     /// The vault was written in a format version this build cannot read.
-    #[error("unsupported vault format version {0} (expected {FORMAT_VERSION})")]
+    #[error(
+        "unsupported vault format version {0} \
+         (supported: {OLDEST_SUPPORTED_VERSION} to {FORMAT_VERSION})"
+    )]
     UnsupportedVersion(u8),
 
     /// The Argon2id parameters of the header are outside the accepted bounds.

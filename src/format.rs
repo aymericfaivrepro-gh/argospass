@@ -12,6 +12,12 @@
 //!
 //! The header is stored in clear but authenticated: it is passed as
 //! associated data (AAD) to XChaCha20-Poly1305.
+//!
+//! What follows the header depends on the format version:
+//! - v1: `nonce || encrypted JSON || tag`, encrypted with the key derived from
+//!   the master password. Still read, and upgraded to the current version.
+//! - v2 (current): `envelope || nonce || encrypted JSON || tag`, see
+//!   [`VaultKey`](crate::crypto::VaultKey).
 
 use crate::crypto::{KdfParams, SALT_LEN};
 use crate::{Error, Result};
@@ -19,8 +25,11 @@ use crate::{Error, Result};
 /// Identifies an ArgosPass vault file.
 pub const MAGIC: &[u8; 5] = b"ARGOS";
 
-/// Current version of the file format.
-pub const FORMAT_VERSION: u8 = 1;
+/// Current version of the file format, always used when writing.
+pub const FORMAT_VERSION: u8 = 2;
+
+/// Oldest format version that can still be opened (and is then upgraded).
+pub const OLDEST_SUPPORTED_VERSION: u8 = 1;
 
 const VERSION_OFFSET: usize = 5;
 const MEMORY_OFFSET: usize = 6;
@@ -68,8 +77,8 @@ impl Header {
             return Err(Error::BadMagic);
         }
 
-        let version = data[VERSION_OFFSET];
-        if version != FORMAT_VERSION {
+        let version = version(data);
+        if !(OLDEST_SUPPORTED_VERSION..=FORMAT_VERSION).contains(&version) {
             return Err(Error::UnsupportedVersion(version));
         }
 
@@ -86,6 +95,12 @@ impl Header {
 
         Ok(Self { params, salt })
     }
+}
+
+/// Returns the format version of a header already validated by
+/// [`Header::from_bytes`].
+pub(crate) fn version(header_bytes: &[u8]) -> u8 {
+    header_bytes[VERSION_OFFSET]
 }
 
 /// Reads a little-endian `u32` at `offset`. The caller guarantees the bounds.
@@ -130,12 +145,27 @@ mod tests {
 
     #[test]
     fn rejects_unknown_version() {
+        for unknown in [OLDEST_SUPPORTED_VERSION - 1, FORMAT_VERSION + 1] {
+            let mut bytes = sample_header().to_bytes();
+            bytes[VERSION_OFFSET] = unknown;
+            assert!(matches!(
+                Header::from_bytes(&bytes),
+                Err(Error::UnsupportedVersion(v)) if v == unknown
+            ));
+        }
+    }
+
+    #[test]
+    fn accepts_older_supported_version() {
         let mut bytes = sample_header().to_bytes();
-        bytes[VERSION_OFFSET] = 99;
-        assert!(matches!(
-            Header::from_bytes(&bytes),
-            Err(Error::UnsupportedVersion(99))
-        ));
+        bytes[VERSION_OFFSET] = OLDEST_SUPPORTED_VERSION;
+        assert_eq!(version(&bytes), OLDEST_SUPPORTED_VERSION);
+        assert_eq!(
+            Header::from_bytes(&bytes).expect("v1 header"),
+            sample_header()
+        );
+        // Written back, it is always in the current version.
+        assert_eq!(version(&sample_header().to_bytes()), FORMAT_VERSION);
     }
 
     #[test]
