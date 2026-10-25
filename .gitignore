@@ -3,3 +3,5 @@ vault.json
 *.argos
 *.argos.*
 *.key
+CLAUDE.local.md
+.claude/settings.local.json
