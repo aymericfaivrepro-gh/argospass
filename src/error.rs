@@ -3,7 +3,10 @@
 use crate::crypto::KdfParams;
 use crate::format::{FORMAT_VERSION, OLDEST_SUPPORTED_VERSION};
 use crate::generator::MIN_LENGTH;
+use crate::pepper::{PEPPER_ID_LEN, PEPPER_LEN};
+use crate::to_hex;
 use std::io;
+use std::path::PathBuf;
 
 /// Everything that can go wrong in the ArgosPass library.
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +43,33 @@ pub enum Error {
     #[error("decryption failed: wrong master password or corrupted vault")]
     DecryptionFailed,
 
+    /// There is no pepper file at this path.
+    #[error("no pepper file at {}", .0.display())]
+    PepperMissing(PathBuf),
+
+    /// The pepper file does not have the size of a pepper.
+    #[error(
+        "invalid pepper file {}: {len} bytes instead of {PEPPER_LEN}",
+        .path.display()
+    )]
+    InvalidPepper { path: PathBuf, len: u64 },
+
+    /// The vault was created with another pepper. Detected from the public
+    /// pepper id in the header, before any key derivation.
+    #[error(
+        "wrong pepper: the vault expects pepper {}, the pepper file is {}",
+        short_id(expected),
+        short_id(found)
+    )]
+    PepperMismatch {
+        expected: [u8; PEPPER_ID_LEN],
+        found: [u8; PEPPER_ID_LEN],
+    },
+
+    /// The vault needs a pepper and none was given.
+    #[error("this vault needs its pepper file")]
+    PepperRequired,
+
     /// Encryption failed (only possible for absurdly large vaults).
     #[error("encryption failed")]
     EncryptionFailed,
@@ -75,6 +105,11 @@ pub enum Error {
 /// Result type of the ArgosPass library.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Shortens a (public) pepper id for messages: its first 4 bytes in hex.
+fn short_id(id: &[u8; PEPPER_ID_LEN]) -> String {
+    to_hex(&id[..4])
+}
+
 // Written by hand: `#[from]` would also expose the JSON error as `source`.
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
@@ -93,6 +128,18 @@ mod tests {
         assert!(matches!(error, Error::Io(_)));
         let source = error.source().expect("an I/O error has a source");
         assert_eq!(source.to_string(), "disk on fire");
+    }
+
+    #[test]
+    fn pepper_mismatch_shows_short_ids() {
+        let error = Error::PepperMismatch {
+            expected: [0xab; PEPPER_ID_LEN],
+            found: [0x01; PEPPER_ID_LEN],
+        };
+        assert_eq!(
+            error.to_string(),
+            "wrong pepper: the vault expects pepper abababab, the pepper file is 01010101"
+        );
     }
 
     #[test]

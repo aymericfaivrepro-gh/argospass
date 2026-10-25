@@ -1,9 +1,9 @@
 use argospass::crypto::VaultKey;
 use argospass::generator::{self, generate_password};
-use argospass::{Entry, Error, Vault};
+use argospass::pepper::Pepper;
+use argospass::{Entry, Error, Vault, create_private_dir, requires_existing_pepper};
 use clap::{Parser, Subcommand};
 use log::{LevelFilter, debug, info};
-use std::fs;
 use std::io::{self, Write};
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,7 @@ const EXIT_INVALID_VAULT: u8 = 4;
 const EXIT_IO: u8 = 5;
 const EXIT_ENTRY_NOT_FOUND: u8 = 6;
 const EXIT_ENTRY_EXISTS: u8 = 7;
+const EXIT_PEPPER: u8 = 8;
 
 const EXIT_STATUS_HELP: &str = "\
 Exit status:
@@ -40,7 +41,8 @@ Exit status:
   4  invalid or unsupported vault file
   5  input/output error
   6  no entry with this title
-  7  an entry with this title already exists";
+  7  an entry with this title already exists
+  8  pepper file missing, invalid, or not the one of this vault";
 
 /// ArgosPass: a command-line password manager.
 #[derive(Parser)]
@@ -49,6 +51,10 @@ struct Cli {
     /// Path to the vault file [default: <user data dir>/argospass/vault.argos]
     #[arg(long, global = true, env = "ARGOSPASS_VAULT")]
     vault: Option<PathBuf>,
+
+    /// Path to the pepper file [default: <user local data dir>/argospass/pepper.key]
+    #[arg(long, global = true, env = "ARGOSPASS_PEPPER")]
+    pepper: Option<PathBuf>,
 
     /// Explain what happens on stderr (-v: main steps, -vv: technical details)
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
@@ -116,13 +122,36 @@ fn main() -> ExitCode {
     }
 }
 
-/// Prints `error` on stderr, followed by the errors that caused it.
-fn report(error: &dyn std::error::Error) {
+/// Prints `error` on stderr, followed by the errors that caused it and, for
+/// some errors, a hint on how to fix it.
+fn report(error: &(dyn std::error::Error + 'static)) {
     eprint!("Error: {error}");
     for cause in iter::successors(error.source(), |e| e.source()) {
         eprint!(": {cause}");
     }
     eprintln!();
+    if let Some(hint) = hint(error) {
+        eprintln!("Hint: {hint}");
+    }
+}
+
+/// Suggests how to fix a pepper error.
+fn hint(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    match error.downcast_ref::<Error>()? {
+        Error::PepperMismatch { .. } => Some(
+            "this vault was created with another pepper: point to the right file \
+             with --pepper <PATH> (or ARGOSPASS_PEPPER)",
+        ),
+        Error::PepperMissing(_) | Error::PepperRequired => Some(
+            "this vault cannot be opened without the pepper file it was created with: \
+             restore it from your backup, or point to it with --pepper <PATH> \
+             (or ARGOSPASS_PEPPER)",
+        ),
+        Error::InvalidPepper { .. } => Some(
+            "this is not an ArgosPass pepper file, or it is damaged: restore it from your backup",
+        ),
+        _ => None,
+    }
 }
 
 /// Chooses the exit code according to what failed.
@@ -140,6 +169,10 @@ fn exit_code(error: &(dyn std::error::Error + 'static)) -> u8 {
             Error::PasswordTooShort { .. } => EXIT_USAGE,
             Error::EntryNotFound(_) => EXIT_ENTRY_NOT_FOUND,
             Error::EntryAlreadyExists(_) => EXIT_ENTRY_EXISTS,
+            Error::PepperMissing(_)
+            | Error::InvalidPepper { .. }
+            | Error::PepperMismatch { .. }
+            | Error::PepperRequired => EXIT_PEPPER,
             Error::EncryptionFailed | Error::KeyDerivation(_) | Error::Random(_) => EXIT_FAILURE,
         };
     }
@@ -152,22 +185,37 @@ fn exit_code(error: &(dyn std::error::Error + 'static)) -> u8 {
 
 fn run() -> AppResult {
     let cli = Cli::parse();
-    let path = match cli.vault {
-        Some(path) => path,
-        None => default_vault_path()?,
-    };
     init_logging(cli.verbose);
-    info!("vault path: {}", path.display());
+    // Needs neither the vault nor the pepper.
+    if let Command::Generate { length, no_symbols } = cli.command {
+        println!("{}", *generate_password(length, !no_symbols)?);
+        return Ok(());
+    }
+
+    let paths = Paths {
+        vault: match cli.vault {
+            Some(path) => path,
+            None => default_vault_path()?,
+        },
+        pepper: match cli.pepper {
+            Some(path) => path,
+            None => default_pepper_path()?,
+        },
+    };
+    info!("vault path: {}", paths.vault.display());
+    info!("pepper path: {}", paths.pepper.display());
 
     match cli.command {
-        Command::Init => init(&path),
-        Command::Passwd { rotate_key } => change_password(&path, rotate_key),
-        Command::Generate { length, no_symbols } => {
-            println!("{}", *generate_password(length, !no_symbols)?);
-            Ok(())
-        }
-        command => execute(&path, command),
+        Command::Init => init(&paths),
+        Command::Passwd { rotate_key } => change_password(&paths, rotate_key),
+        command => execute(&paths, command),
     }
+}
+
+/// Files a command works on.
+struct Paths {
+    vault: PathBuf,
+    pepper: PathBuf,
 }
 
 /// Returns the default vault location inside the user's data directory.
@@ -176,26 +224,80 @@ fn default_vault_path() -> AppResult<PathBuf> {
     Ok(data_dir.join("argospass").join("vault.argos"))
 }
 
-/// Creates a new vault protected by a new master password.
-fn init(path: &Path) -> AppResult {
+/// Returns the default pepper location inside the user's *local* data
+/// directory: on Windows, `%LOCALAPPDATA%`, which roaming profiles do not sync
+/// (unlike `%APPDATA%`, where the vault is).
+fn default_pepper_path() -> AppResult<PathBuf> {
+    let dir = dirs::data_local_dir().ok_or("cannot determine the user local data directory")?;
+    Ok(dir.join("argospass").join("pepper.key"))
+}
+
+/// Creates a new vault protected by a new master password and the pepper.
+fn init(paths: &Paths) -> AppResult {
+    let path = paths.vault.as_path();
     if path.exists() {
         return Err("a vault already exists".into());
     }
 
     let password = ask_new_password("New master password: ")?;
+    // Created (and on disk) before the vault, which cannot be opened without it.
+    let pepper = match Pepper::load(&paths.pepper) {
+        Ok(pepper) => {
+            info!("reusing the existing pepper {}", paths.pepper.display());
+            pepper
+        }
+        Err(Error::PepperMissing(_)) => create_pepper(&paths.pepper)?,
+        Err(error) => return Err(error.into()),
+    };
     if let Some(parent) = path.parent() {
         create_private_dir(parent)?;
     }
-    let key = VaultKey::new(&password)?;
+    let key = VaultKey::new(&password, &pepper)?;
     Vault::new().save(path, &key)?;
     println!("Vault created at {}", path.display());
     Ok(())
 }
 
+/// Creates a new pepper file and tells the user, very visibly, to back it up.
+fn create_pepper(path: &Path) -> AppResult<Pepper> {
+    let pepper = Pepper::create(path)?;
+    eprintln!(
+        "\n\
+         ************************************************************************\n\
+         * A new PEPPER FILE was created: {}\n\
+         *\n\
+         * The vault CANNOT BE OPENED WITHOUT IT, even with the right master\n\
+         * password. Back it up now, SEPARATELY FROM THE VAULT (for example on a\n\
+         * USB key, or in another password manager), and never keep it next to\n\
+         * the vault in a synced folder (cloud drive, shared backup).\n\
+         ************************************************************************\n",
+        path.display()
+    );
+    Ok(pepper)
+}
+
+/// Loads the pepper of an existing vault.
+///
+/// If the pepper file is missing, it is only created for a vault in an older
+/// format, which is then upgraded to use it. A vault that already uses a
+/// pepper can only be opened with its own.
+fn pepper_for_vault(paths: &Paths) -> AppResult<Pepper> {
+    match Pepper::load(&paths.pepper) {
+        Ok(pepper) => Ok(pepper),
+        Err(Error::PepperMissing(_)) if !requires_existing_pepper(&paths.vault)? => {
+            info!("the vault predates peppers: creating one for its upgrade");
+            create_pepper(&paths.pepper)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Changes the master password. With `rotate_key`, also replaces the data key.
-fn change_password(path: &Path, rotate_key: bool) -> AppResult {
+fn change_password(paths: &Paths, rotate_key: bool) -> AppResult {
+    let path = paths.vault.as_path();
     require_vault(path)?;
-    let (vault, key) = unlock(path)?;
+    let pepper = pepper_for_vault(paths)?;
+    let (vault, key) = unlock(path, &pepper)?;
 
     if rotate_key {
         eprintln!("Choose the new master password (it may be the current one).");
@@ -207,16 +309,16 @@ fn change_password(path: &Path, rotate_key: bool) -> AppResult {
     // Without a new data key, keeping the same password would change nothing.
     // The current password is not kept in memory: a new password equal to it
     // is recognized because it opens the current envelope.
-    if !rotate_key && key.opens_with(&new_password)? {
+    if !rotate_key && key.opens_with(&new_password, &pepper)? {
         return Err("the new password must be different from the current one".into());
     }
 
     let new_key = if rotate_key {
         info!("generating a new data key");
         drop(key); // wipes the old data key now
-        VaultKey::new(&new_password)?
+        VaultKey::new(&new_password, &pepper)?
     } else {
-        key.rewrap(&new_password)?
+        key.rewrap(&new_password, &pepper)?
     };
     vault.save_and_replace_backup(path, &new_key)?;
 
@@ -249,9 +351,11 @@ fn require_vault(path: &Path) -> AppResult {
 }
 
 /// Unlocks the vault with the master password, then runs the command.
-fn execute(path: &Path, command: Command) -> AppResult {
+fn execute(paths: &Paths, command: Command) -> AppResult {
+    let path = paths.vault.as_path();
     require_vault(path)?;
-    let (mut vault, key) = unlock(path)?;
+    let pepper = pepper_for_vault(paths)?;
+    let (mut vault, key) = unlock(path, &pepper)?;
 
     match command {
         Command::Init | Command::Generate { .. } | Command::Passwd { .. } => {
@@ -307,13 +411,13 @@ fn execute(path: &Path, command: Command) -> AppResult {
     Ok(())
 }
 
-/// Prompts for the master password and opens the vault.
+/// Prompts for the master password and opens the vault with the pepper.
 /// After a wrong password, asks again, up to `MAX_PASSWORD_ATTEMPTS` times.
-fn unlock(path: &Path) -> AppResult<(Vault, VaultKey)> {
+fn unlock(path: &Path, pepper: &Pepper) -> AppResult<(Vault, VaultKey)> {
     let mut attempts_left = MAX_PASSWORD_ATTEMPTS;
     loop {
         let master_password = Zeroizing::new(rpassword::prompt_password("Master password: ")?);
-        match Vault::open(path, &master_password) {
+        match Vault::open(path, &master_password, pepper) {
             Err(Error::DecryptionFailed) if attempts_left > 1 => {
                 attempts_left -= 1;
                 let plural = if attempts_left == 1 { "" } else { "s" };
@@ -338,19 +442,6 @@ fn ask_new_password(prompt: &str) -> AppResult<Zeroizing<String>> {
     }
     Ok(password)
 }
-/// Creates `dir` and its parents if needed.
-/// On Unix, newly created directories are restricted to the owner (`700`).
-fn create_private_dir(dir: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(dir)
-}
-
 /// Copies `secret` to the clipboard, waits, then clears it.
 ///
 /// The clipboard is only cleared if it still contains `secret`,

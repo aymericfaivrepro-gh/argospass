@@ -3,16 +3,18 @@ pub mod crypto;
 mod error;
 pub mod format;
 pub mod generator;
+pub mod pepper;
 
 pub use error::{Error, Result};
 
 use crypto::{ENVELOPE_LEN, KdfParams, NONCE_LEN, SALT_LEN, TAG_LEN, VaultKey};
 use format::{FORMAT_VERSION, HEADER_LEN, Header, MAGIC};
 use log::{debug, info, warn};
+use pepper::Pepper;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -87,40 +89,56 @@ impl Vault {
             .ok_or_else(|| Error::EntryNotFound(title.to_string()))
     }
 
-    /// Opens and decrypts a vault file with the master password.
+    /// Opens and decrypts a vault file with the master password and the pepper.
     ///
-    /// Vaults in an older format (v1, or the legacy format before it) are
-    /// upgraded automatically to the current format.
-    /// Fails with [`Error::DecryptionFailed`] if the master password is wrong
-    /// or if the file has been modified.
-    pub fn open(path: &Path, password: &str) -> Result<(Self, VaultKey)> {
+    /// Vaults in an older format (v2, v1, or the legacy format before them)
+    /// are opened without the pepper, then upgraded automatically to the
+    /// current format, which uses it.
+    /// Fails with [`Error::PepperMismatch`] if the vault was created with
+    /// another pepper, and with [`Error::DecryptionFailed`] if the master
+    /// password is wrong or if the file has been modified.
+    pub fn open(path: &Path, password: &str, pepper: &Pepper) -> Result<(Self, VaultKey)> {
         let data = fs::read(path)?;
         info!("opening vault");
         debug!("read {} bytes from {}", data.len(), path.display());
 
         if !data.starts_with(MAGIC) {
-            return Self::open_legacy(path, password, &data);
+            return Self::open_legacy(path, password, pepper, &data);
         }
 
         let header = Header::from_bytes(&data)?;
-        let (header_bytes, rest) = data.split_at(HEADER_LEN);
-        let version = format::version(header_bytes);
-        debug!("format version {version}, {:?}", header.params);
+        let (header_bytes, rest) = data.split_at(header.encoded_len());
+        debug!("format version {}, {:?}", header.version(), header.params);
         debug!("salt (from file header): {}", to_hex(&header.salt));
+        if let Some(pepper_id) = header.pepper_id() {
+            debug!("pepper id (from file header): {}", to_hex(&pepper_id));
+        }
 
-        match version {
-            1 => Self::open_v1(path, password, &header, header_bytes, rest),
-            FORMAT_VERSION => Self::open_v2(password, header, rest),
+        match header.version() {
+            1 => Self::open_v1(path, password, pepper, &header, header_bytes, rest),
+            2 => {
+                let (vault, old_key) = Self::open_envelope(password, header, rest, None)?;
+                drop(old_key); // wipes the v2 data key: the upgrade generates a new one
+                warn!("vault uses format v2 (no pepper): upgrading it to format v{FORMAT_VERSION}");
+                vault.upgrade(path, password, pepper)
+            }
+            FORMAT_VERSION => Self::open_envelope(password, header, rest, Some(pepper)),
             // Already rejected by `Header::from_bytes`.
             other => Err(Error::UnsupportedVersion(other)),
         }
     }
 
-    /// Opens a vault in the current format: `header || envelope || payload`.
+    /// Opens a vault in format v2 or later: `header || envelope || payload`.
     ///
-    /// The KEK derived from the master password unwraps the data key from the
-    /// envelope, and the data key decrypts the payload.
-    fn open_v2(password: &str, header: Header, rest: &[u8]) -> Result<(Self, VaultKey)> {
+    /// The KEK derived from the master password (and the pepper from format
+    /// v3 on) unwraps the data key from the envelope, and the data key
+    /// decrypts the payload.
+    fn open_envelope(
+        password: &str,
+        header: Header,
+        rest: &[u8],
+        pepper: Option<&Pepper>,
+    ) -> Result<(Self, VaultKey)> {
         // Checked before running Argon2id: a truncated file must fail fast.
         if rest.len() < ENVELOPE_LEN + NONCE_LEN + TAG_LEN {
             return Err(Error::Truncated);
@@ -133,7 +151,7 @@ impl Vault {
             payload.len()
         );
 
-        let key = VaultKey::unlock(password, header, envelope)?;
+        let key = VaultKey::unlock(password, header, envelope, pepper)?;
         let plaintext = key.decrypt(payload)?;
         let vault: Vault = serde_json::from_slice(&plaintext)?;
         info!("vault decrypted: {} entries", vault.entries.len());
@@ -142,31 +160,37 @@ impl Vault {
 
     /// Opens a vault in format v1 (`header || nonce || ciphertext || tag`,
     /// encrypted with the key derived from the master password), then rewrites
-    /// it in the current format. The v1 file is kept as the `.bak` backup.
+    /// it in the current format.
     fn open_v1(
         path: &Path,
         password: &str,
+        pepper: &Pepper,
         header: &Header,
         header_bytes: &[u8],
         encrypted: &[u8],
     ) -> Result<(Self, VaultKey)> {
         // The raw header bytes from the file are the associated data: they are
-        // what v1 authenticated (`Header::to_bytes` would write version 2).
+        // exactly what v1 authenticated.
         let vault: Vault = {
-            let key = crypto::derive_key(password, &header.salt, &header.params)?;
+            let key = crypto::derive_key(password, &header.salt, &header.params, None)?;
             let plaintext = crypto::decrypt(&key, encrypted, header_bytes)?;
             serde_json::from_slice(&plaintext)?
         }; // the v1 key and the decrypted JSON are wiped here
         info!("vault decrypted: {} entries", vault.entries.len());
 
         warn!("vault uses format v1: upgrading it to format v{FORMAT_VERSION}");
-        vault.upgrade(path, password)
+        vault.upgrade(path, password, pepper)
     }
 
     /// Opens a vault in the legacy layout (`salt || nonce || ciphertext || tag`,
     /// fixed Argon2id parameters, no associated data), then rewrites it in the
-    /// current format. The legacy file is kept as the `.bak` backup.
-    fn open_legacy(path: &Path, password: &str, data: &[u8]) -> Result<(Self, VaultKey)> {
+    /// current format.
+    fn open_legacy(
+        path: &Path,
+        password: &str,
+        pepper: &Pepper,
+        data: &[u8],
+    ) -> Result<(Self, VaultKey)> {
         if data.len() < SALT_LEN {
             return Err(Error::Truncated);
         }
@@ -176,31 +200,35 @@ impl Vault {
         debug!("legacy vault, salt: {}", to_hex(&salt));
 
         let vault: Vault = {
-            let key = crypto::derive_key(password, &salt, &KdfParams::LEGACY)?;
+            let key = crypto::derive_key(password, &salt, &KdfParams::LEGACY, None)?;
             let plaintext = crypto::decrypt(&key, encrypted, &[])?;
             serde_json::from_slice(&plaintext)?
         }; // the legacy key and the decrypted JSON are wiped here
         info!("vault decrypted: {} entries", vault.entries.len());
 
         warn!("vault uses the legacy format: upgrading it to format v{FORMAT_VERSION}");
-        vault.upgrade(path, password)
+        vault.upgrade(path, password, pepper)
     }
 
     /// Rewrites a vault opened from an older format in the current format.
     ///
-    /// Everything is regenerated: new salt, current Argon2id parameters and a
-    /// new random data key. The key derived for the old format is never reused.
-    fn upgrade(self, path: &Path, password: &str) -> Result<(Self, VaultKey)> {
-        let key = VaultKey::new(password)?;
-        self.save(path, &key)?;
+    /// Everything is regenerated: new salt, current Argon2id parameters, the
+    /// pepper, and a new random data key. The old key is never reused: an old
+    /// copy and the password would otherwise give the data key without the
+    /// pepper. The backup is replaced too, so that no copy without the pepper
+    /// is left next to the vault.
+    fn upgrade(self, path: &Path, password: &str, pepper: &Pepper) -> Result<(Self, VaultKey)> {
+        let key = VaultKey::new(password, pepper)?;
+        self.save_and_replace_backup(path, &key)?;
         Ok((self, key))
     }
 
     /// Encrypts and writes the vault to a file.
     ///
-    /// File layout: `header || envelope (72 bytes) || nonce (24 bytes) ||
-    /// ciphertext || tag (16 bytes)`. The header (see [`format`](mod@format))
-    /// and the envelope are authenticated as associated data.
+    /// File layout: `header (50 bytes) || envelope (72 bytes) || nonce
+    /// (24 bytes) || ciphertext || tag (16 bytes)`. The header (see
+    /// [`format`](mod@format)) and the envelope are authenticated as
+    /// associated data.
     pub fn save(&self, path: &Path, key: &VaultKey) -> Result<()> {
         info!("saving vault ({} entries)", self.entries.len());
         let plaintext = self.to_json()?;
@@ -242,6 +270,33 @@ impl Vault {
         debug_assert_eq!(json.capacity(), capacity, "buffer was reallocated");
         Ok(json)
     }
+}
+
+/// Tells whether the vault at `path` can only be opened with an existing
+/// pepper (format v3 and later).
+///
+/// Older formats return `false`: they are upgraded with the pepper when
+/// opened, so a missing pepper file may be created for them. Only the start of
+/// the file is read, and nothing is authenticated yet.
+pub fn requires_existing_pepper(path: &Path) -> Result<bool> {
+    let mut start = Vec::with_capacity(HEADER_LEN);
+    fs::File::open(path)?
+        .take(HEADER_LEN as u64)
+        .read_to_end(&mut start)?;
+    Ok(format::needs_pepper(&start))
+}
+
+/// Creates `dir` and its parents if needed.
+/// On Unix, newly created directories are restricted to the owner (`700`).
+pub fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
 }
 
 /// A writer that discards its input and only counts the bytes written.
