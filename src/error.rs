@@ -1,8 +1,9 @@
 //! Errors returned by the ArgosPass library.
 
+use crate::MAX_VAULT_LEN;
 use crate::crypto::KdfParams;
-use crate::format::{FORMAT_VERSION, OLDEST_SUPPORTED_VERSION};
-use crate::generator::MIN_LENGTH;
+use crate::format::FORMAT_VERSION;
+use crate::generator::{MAX_LENGTH, MIN_LENGTH};
 use crate::pepper::{PEPPER_ID_LEN, PEPPER_LEN, short_id};
 use std::io;
 use std::path::PathBuf;
@@ -22,12 +23,13 @@ pub enum Error {
     #[error("not an ArgosPass vault (bad magic number)")]
     BadMagic,
 
-    /// The vault was written in a format version this build cannot read.
-    #[error(
-        "unsupported vault format version {0} \
-         (supported: {OLDEST_SUPPORTED_VERSION} to {FORMAT_VERSION})"
-    )]
+    /// The vault was written in a format version this build does not open.
+    #[error("unsupported vault format version {0} (only version {FORMAT_VERSION} can be opened)")]
     UnsupportedVersion(u8),
+
+    /// The vault file is larger than any vault can be.
+    #[error("the vault file is too large: {0} bytes (at most {MAX_VAULT_LEN})")]
+    VaultTooLarge(u64),
 
     /// The Argon2id parameters of the header are outside the accepted bounds.
     #[error(
@@ -65,10 +67,6 @@ pub enum Error {
         found: [u8; PEPPER_ID_LEN],
     },
 
-    /// The vault needs a pepper and none was given.
-    #[error("this vault needs its pepper file")]
-    PepperRequired,
-
     /// Another pepper file is already where a pepper is being installed. It
     /// is never overwritten.
     #[error(
@@ -93,10 +91,11 @@ pub enum Error {
 
     /// The vault content could not be converted to or from JSON.
     ///
-    /// Only the position is shown, and the error is not exposed as `source`:
-    /// serde_json's own message may quote the decrypted content, that is, secrets.
-    #[error("invalid vault content (line {}, column {})", .0.line(), .0.column())]
-    Json(serde_json::Error),
+    /// Only the position is kept, not serde_json's own error: its message may
+    /// quote the decrypted content, that is, secrets, and would show it in
+    /// `{:?}` or as `source`.
+    #[error("invalid vault content (line {line}, column {column})")]
+    Json { line: usize, column: usize },
 
     /// Argon2id rejected its inputs or parameters.
     #[error("key derivation failed")]
@@ -120,6 +119,10 @@ pub enum Error {
     #[error("password length must be at least {MIN_LENGTH} (got {length})")]
     PasswordTooShort { length: usize },
 
+    /// A generated password was requested longer than [`MAX_LENGTH`].
+    #[error("password length must be at most {MAX_LENGTH} (got {length})")]
+    PasswordTooLong { length: usize },
+
     /// No entry has this title.
     #[error("no entry named \"{0}\"")]
     EntryNotFound(String),
@@ -127,15 +130,32 @@ pub enum Error {
     /// An entry with this title already exists.
     #[error("an entry named \"{0}\" already exists")]
     EntryAlreadyExists(String),
+
+    /// Another command holds the lock of the vault (see
+    /// [`VaultLock`](crate::VaultLock)).
+    #[error("the vault is in use by another ArgosPass command")]
+    VaultBusy,
+
+    /// The vault was saved, but its backup could not be replaced: the backup
+    /// still holds the previous version.
+    #[error("the vault was saved, but its backup {} could not be replaced", .path.display())]
+    BackupNotReplaced {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// Result type of the ArgosPass library.
 pub type Result<T> = std::result::Result<T, Error>;
 
-// Written by hand: `#[from]` would also expose the JSON error as `source`.
+// Written by hand: only the position is kept (see `Error::Json`).
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
-        Self::Json(e)
+        Self::Json {
+            line: e.line(),
+            column: e.column(),
+        }
     }
 }
 
@@ -172,10 +192,18 @@ mod tests {
         // serde_json quotes the offending value...
         assert!(json_error.to_string().contains("hunter2"));
 
-        // ...but our error neither displays it nor exposes it as its source.
+        // ...but our error keeps only its position: neither its message, nor
+        // its debug form, nor a source shows the value.
         let error = Error::from(json_error);
-        assert!(matches!(error, Error::Json(_)));
+        assert!(matches!(
+            error,
+            Error::Json {
+                line: 1,
+                column: 20
+            }
+        ));
         assert!(!error.to_string().contains("hunter2"));
+        assert!(!format!("{error:?}").contains("hunter2"));
         assert!(error.source().is_none());
     }
 }

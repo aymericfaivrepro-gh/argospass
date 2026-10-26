@@ -10,19 +10,27 @@ pub const DEFAULT_LENGTH: usize = 24;
 /// Minimum accepted length of generated passwords.
 pub const MIN_LENGTH: usize = 8;
 
+/// Maximum accepted length of generated passwords: far more than any site
+/// accepts, and a bound on the memory a typo in `--length` can ask for.
+pub const MAX_LENGTH: usize = 1024;
+
 const LOWERCASE: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
 const UPPERCASE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const DIGITS: &[u8] = b"0123456789";
 /// Symbols that are safe to type and paste: no quotes, backslash, backtick or space.
 const SYMBOLS: &[u8] = b"!#$%&()*+,-./:;<=>?@[]^_{|}~";
 
-/// Generates a random password of `length` characters.
+/// Generates a random password of `length` characters, from [`MIN_LENGTH`] to
+/// [`MAX_LENGTH`].
 ///
 /// Uses the operating system's CSPRNG and rejection sampling,
 /// so every allowed character has exactly the same probability.
 pub fn generate_password(length: usize, symbols: bool) -> Result<Zeroizing<String>> {
     if length < MIN_LENGTH {
         return Err(Error::PasswordTooShort { length });
+    }
+    if length > MAX_LENGTH {
+        return Err(Error::PasswordTooLong { length });
     }
 
     let mut charset = Vec::new();
@@ -86,8 +94,8 @@ mod tests {
     fn password_buffer_is_never_reallocated() {
         // The capacity reserved up front must be enough: a reallocation
         // would leave an unwiped copy of the password behind.
-        let password = generate_password(10_000, true).expect("generation should succeed");
-        assert_eq!(password.capacity(), 10_000);
+        let password = generate_password(MAX_LENGTH, true).expect("generation should succeed");
+        assert_eq!(password.capacity(), MAX_LENGTH);
     }
 
     #[test]
@@ -99,6 +107,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_too_long_length() {
+        // Refused before allocating anything: `usize::MAX` used to panic.
+        for length in [MAX_LENGTH + 1, usize::MAX] {
+            assert!(matches!(
+                generate_password(length, true),
+                Err(Error::PasswordTooLong { length: found }) if found == length
+            ));
+        }
+    }
+
+    #[test]
     fn two_passwords_differ() {
         let a = generate_password(DEFAULT_LENGTH, true).expect("generation should succeed");
         let b = generate_password(DEFAULT_LENGTH, true).expect("generation should succeed");
@@ -107,9 +126,12 @@ mod tests {
 
     #[test]
     fn every_allowed_character_can_appear() {
-        // With 10,000 draws among 90 characters, missing any of them is
-        // astronomically unlikely (about 1 chance in 10^46).
-        let password = generate_password(10_000, true).expect("generation should succeed");
+        // In 10 passwords of 1,024 draws among 90 characters, missing any of
+        // them is astronomically unlikely (about 1 chance in 10^47).
+        let password: String = (0..10)
+            .map(|_| generate_password(MAX_LENGTH, true).expect("generation should succeed"))
+            .map(|password| password.to_string())
+            .collect();
         for &c in LOWERCASE
             .iter()
             .chain(UPPERCASE)

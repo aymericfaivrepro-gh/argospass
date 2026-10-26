@@ -13,10 +13,10 @@
       "Bash(git status:*)",
       "Bash(git diff:*)",
       "Bash(git log:*)",
-      "Bash(git show:*)",
-      "Bash(xxd:*)"
+      "Bash(git show:*)"
     ],
     "ask": [
+      "Bash(xxd:*)",
       "Bash(cargo run:*)",
       "Bash(cargo add:*)",
       "Bash(cargo remove:*)",

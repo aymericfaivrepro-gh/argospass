@@ -1,9 +1,12 @@
 use argospass::crypto::VaultKey;
+use argospass::format::FORMAT_VERSION;
 use argospass::generator::{self, generate_password};
 use argospass::pepper::{Installed, PEPPER_ID_LEN, Pepper, recovery_code_is_complete, short_id};
-use argospass::{Error, Vault, create_private_dir, requires_existing_pepper, vault_pepper_id};
+use argospass::{Error, Vault, VaultLock, create_private_dir, vault_files, vault_pepper_id};
 use clap::{Parser, Subcommand};
 use log::{LevelFilter, debug, info};
+use std::fmt::{self, Write as _};
+use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -20,6 +23,11 @@ const CLIPBOARD_TIMEOUT_SECS: u64 = 20;
 
 /// Number of master password attempts before giving up.
 const MAX_PASSWORD_ATTEMPTS: u32 = 3;
+
+/// Minimum length of a new master password, in characters. The pepper does not
+/// help against someone who gets both files (a backup of the whole directory):
+/// the master password is then all that protects the vault.
+const MIN_MASTER_PASSWORD_CHARS: usize = 12;
 
 /// Largest input accepted from stdin by `pepper import`: far more than a
 /// recovery code (99 characters) needs, whatever spaces or line breaks
@@ -119,10 +127,10 @@ enum Command {
     },
     /// Check, back up or restore the pepper file (no master password needed)
     ///
-    /// Every vault created since format v3 needs the pepper file, in addition to
-    /// the master password. `export` prints the pepper as a recovery code to
-    /// write down, and `import` rebuilds the pepper file from that code: after
-    /// losing it, or on a second computer.
+    /// Every vault needs the pepper file, in addition to the master password.
+    /// `export` prints the pepper as a recovery code to write down, and
+    /// `import` rebuilds the pepper file from that code: after losing it, or
+    /// on a second computer.
     Pepper {
         #[command(subcommand)]
         command: PepperCommand,
@@ -172,14 +180,14 @@ fn report(error: &(dyn std::error::Error + 'static)) {
     }
 }
 
-/// Suggests how to fix a pepper error.
+/// Suggests how to fix some errors.
 fn hint(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
     match error.downcast_ref::<Error>()? {
         Error::PepperMismatch { .. } => Some(
             "this vault was created with another pepper: point to the right file \
              with --pepper <PATH> (or ARGOSPASS_PEPPER)",
         ),
-        Error::PepperMissing(_) | Error::PepperRequired => Some(
+        Error::PepperMissing(_) => Some(
             "this vault cannot be opened without the pepper file it was created with: \
              restore it from your backup, or point to it with --pepper <PATH> \
              (or ARGOSPASS_PEPPER)",
@@ -197,6 +205,22 @@ fn hint(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
             "check the code against your copy: it is the line printed by \
              `argospass pepper export`; spaces, line breaks and letter case do not matter",
         ),
+        Error::UnsupportedVersion(version) if *version < FORMAT_VERSION => Some(
+            "this vault is in an older format, which ArgosPass no longer opens \
+             (see \"Older formats\" in the README to convert it); it was left as it is",
+        ),
+        Error::UnsupportedVersion(_) => {
+            Some("this vault was written by a newer version of ArgosPass: update ArgosPass")
+        }
+        Error::BadMagic => Some(
+            "the vaults of the first versions of ArgosPass, without a header, are no longer \
+             opened: see \"Older formats\" in the README",
+        ),
+        Error::BackupNotReplaced { .. } => Some(
+            "the vault itself was saved (after `passwd`, with the new master password). Its \
+             backup still holds the previous version, which opens with the old password: \
+             delete it yourself",
+        ),
         _ => None,
     }
 }
@@ -210,23 +234,24 @@ fn exit_code(error: &(dyn std::error::Error + 'static)) -> u8 {
             Error::Truncated
             | Error::BadMagic
             | Error::UnsupportedVersion(_)
+            | Error::VaultTooLarge(_)
             | Error::UnsupportedKdfParams(_)
-            | Error::Json(_) => EXIT_INVALID_VAULT,
-            Error::Io(_) => EXIT_IO,
-            Error::PasswordTooShort { .. } => EXIT_USAGE,
+            | Error::Json { .. } => EXIT_INVALID_VAULT,
+            Error::Io(_) | Error::BackupNotReplaced { .. } => EXIT_IO,
+            Error::PasswordTooShort { .. } | Error::PasswordTooLong { .. } => EXIT_USAGE,
             Error::EntryNotFound(_) => EXIT_ENTRY_NOT_FOUND,
             Error::EntryAlreadyExists(_) => EXIT_ENTRY_EXISTS,
             Error::PepperMissing(_)
             | Error::InvalidPepper { .. }
             | Error::PepperMismatch { .. }
-            | Error::PepperRequired
             | Error::DifferentPepperExists { .. } => EXIT_PEPPER,
             Error::InvalidRecoveryCode(_) => EXIT_RECOVERY_CODE,
             Error::EncryptionFailed
             | Error::KeyDerivation(_)
             | Error::SubkeyDerivation
             | Error::FieldNameTooLong(_)
-            | Error::Random(_) => EXIT_FAILURE,
+            | Error::Random(_)
+            | Error::VaultBusy => EXIT_FAILURE,
         };
     }
     if error.is::<io::Error>() {
@@ -257,6 +282,7 @@ fn run() -> AppResult {
     };
     info!("vault path: {}", paths.vault.display());
     info!("pepper path: {}", paths.pepper.display());
+    check_paths(&paths)?;
 
     match cli.command {
         Command::Init => init(&paths),
@@ -290,6 +316,42 @@ fn default_pepper_path() -> AppResult<PathBuf> {
     Ok(dir.join("argospass").join("pepper.key"))
 }
 
+/// Fails if the pepper file is one of the files written for the vault (the
+/// vault itself, its backup, their temporary files, its lock): saving the
+/// vault would overwrite the pepper, and the vault could never be opened
+/// again. Checked before anything is read or written.
+fn check_paths(paths: &Paths) -> AppResult {
+    let pepper = comparable(&paths.pepper)?;
+    for file in vault_files(&paths.vault) {
+        if comparable(&file)? == pepper {
+            let message = format!(
+                "the pepper path {} is also used for the vault ({}): choose another path \
+                 for the pepper",
+                paths.pepper.display(),
+                file.display()
+            );
+            return Err(message.into());
+        }
+    }
+    Ok(())
+}
+
+/// Returns `path` in a form that can be compared with another path: absolute,
+/// with `..` and symbolic links resolved as far as the file exists, or else
+/// its directory.
+fn comparable(path: &Path) -> io::Result<PathBuf> {
+    if let Ok(resolved) = fs::canonicalize(path) {
+        return Ok(resolved);
+    }
+    let path = std::path::absolute(path)?;
+    if let (Some(dir), Some(name)) = (path.parent(), path.file_name())
+        && let Ok(dir) = fs::canonicalize(dir)
+    {
+        return Ok(dir.join(name));
+    }
+    Ok(path)
+}
+
 /// Creates a new vault protected by a new master password and the pepper.
 fn init(paths: &Paths) -> AppResult {
     let path = paths.vault.as_path();
@@ -297,7 +359,7 @@ fn init(paths: &Paths) -> AppResult {
         return Err("a vault already exists".into());
     }
 
-    let password = ask_new_password("New master password: ")?;
+    let password = ask_new_master_password()?;
     // Created (and on disk) before the vault, which cannot be opened without it.
     let pepper = match Pepper::load(&paths.pepper) {
         Ok(pepper) => {
@@ -311,6 +373,13 @@ fn init(paths: &Paths) -> AppResult {
         create_private_dir(parent)?;
     }
     let key = VaultKey::new(&password, &pepper)?;
+
+    // Checked again right before writing, under the lock: a vault may have
+    // appeared while the password was typed (another command, a synced folder).
+    let _lock = VaultLock::acquire(path)?;
+    if path.exists() {
+        return Err("a vault already exists".into());
+    }
     Vault::new().save(path, &key)?;
     println!("Vault created at {}", path.display());
     Ok(())
@@ -338,38 +407,20 @@ fn create_pepper(path: &Path) -> AppResult<Pepper> {
 
 /// Loads the pepper of an existing vault.
 ///
-/// If the pepper file is missing, it is only created for a vault in an older
-/// format, which is then upgraded to use it. A vault that already uses a
-/// pepper can only be opened with its own: this is checked here, before the
-/// master password is asked for.
-fn pepper_for_vault(paths: &Paths) -> AppResult<Pepper> {
-    let pepper = match Pepper::load(&paths.pepper) {
-        Ok(pepper) => pepper,
-        Err(Error::PepperMissing(_)) if !requires_existing_pepper(&paths.vault)? => {
-            info!("the vault predates peppers: creating one for its upgrade");
-            return create_pepper(&paths.pepper);
-        }
-        Err(error) => return Err(error.into()),
-    };
-    check_pepper(&paths.vault, &pepper)?;
-    Ok(pepper)
-}
-
-/// Fails with [`Error::PepperMismatch`] if the vault at `path` was created
-/// with another pepper. A vault older than format v3 has no pepper to check.
-///
-/// Only the header is read, so a wrong pepper is reported without asking for
-/// a master password that could not open the vault anyway. The id read here
+/// The vault header is read first, so that a vault in another format is
+/// reported as such, whatever the state of the pepper file. Then the pepper
+/// must be the one the vault was created with: this is checked here, before
+/// the master password is asked for, from the header alone. The id read here
 /// is not authenticated yet, and the file may change before it is opened:
 /// [`Vault::open`] checks it again, and the envelope's tag covers it.
-fn check_pepper(path: &Path, pepper: &Pepper) -> AppResult {
-    if let Some(expected) = vault_pepper_id(path)? {
-        let found = pepper.id();
-        if found != expected {
-            return Err(Error::PepperMismatch { expected, found }.into());
-        }
+fn pepper_for_vault(paths: &Paths) -> AppResult<Pepper> {
+    let expected = vault_pepper_id(&paths.vault)?;
+    let pepper = Pepper::load(&paths.pepper)?;
+    let found = pepper.id();
+    if found != expected {
+        return Err(Error::PepperMismatch { expected, found }.into());
     }
-    Ok(())
+    Ok(pepper)
 }
 
 /// Changes the master password. With `rotate_key`, also replaces the data key.
@@ -377,6 +428,8 @@ fn change_password(paths: &Paths, rotate_key: bool) -> AppResult {
     let path = paths.vault.as_path();
     require_vault(path)?;
     let pepper = pepper_for_vault(paths)?;
+    // Held until the new version is saved.
+    let _lock = VaultLock::acquire(path)?;
     let (mut vault, key) = unlock(path, &pepper)?;
 
     if rotate_key {
@@ -384,7 +437,7 @@ fn change_password(paths: &Paths, rotate_key: bool) -> AppResult {
     } else {
         eprintln!("Choose the new master password.");
     }
-    let new_password = ask_new_password("New master password: ")?;
+    let new_password = ask_new_master_password()?;
 
     // Without a new data key, keeping the same password would change nothing.
     // The current password is not kept in memory: a new password equal to it
@@ -465,18 +518,14 @@ fn vault_status(path: &Path, pepper_id: Option<&[u8; PEPPER_ID_LEN]>) -> AppResu
     if !path.exists() {
         return Ok(None);
     }
-    let status = match (vault_pepper_id(path)?, pepper_id) {
-        (None, _) => "the vault predates the pepper (format v2 or older): \
-                      opening it upgrades it to use the pepper"
-            .to_string(),
-        (Some(expected), Some(found)) if expected == *found => {
-            "the pepper matches this vault".to_string()
-        }
-        (Some(expected), Some(_)) => format!(
+    let expected = vault_pepper_id(path)?;
+    let status = match pepper_id {
+        Some(found) if *found == expected => "the pepper matches this vault".to_string(),
+        Some(_) => format!(
             "the pepper does NOT match this vault, which needs pepper {}",
             short_id(&expected)
         ),
-        (Some(expected), None) => format!(
+        None => format!(
             "this vault needs pepper {}, and there is no pepper file",
             short_id(&expected)
         ),
@@ -629,6 +678,13 @@ fn execute(paths: &Paths, command: Command) -> AppResult {
     let path = paths.vault.as_path();
     require_vault(path)?;
     let pepper = pepper_for_vault(paths)?;
+    // A command that changes the vault holds its lock from reading it to
+    // saving it. Reading alone needs none: a save replaces the file in one go.
+    let lock = if matches!(command, Command::Add { .. } | Command::Remove { .. }) {
+        Some(VaultLock::acquire(path)?)
+    } else {
+        None
+    };
     let (mut vault, key) = unlock(path, &pepper)?;
 
     match command {
@@ -653,6 +709,9 @@ fn execute(paths: &Paths, command: Command) -> AppResult {
             // Sealed right away: only the encrypted password is kept in the vault.
             vault.add(&key, &title, &username, &password, url.as_deref())?;
             vault.save(path, &key)?;
+            // Saved: no need to keep other commands waiting while the password
+            // sits in the clipboard.
+            drop(lock);
             println!("Entry \"{title}\" added");
             if generate {
                 copy_temporarily(&password)?;
@@ -663,21 +722,25 @@ fn execute(paths: &Paths, command: Command) -> AppResult {
                 println!("The vault is empty.");
             }
             for entry in vault.list() {
-                println!("- {} ({})", entry.title, entry.username);
+                println!(
+                    "- {} ({})",
+                    Printable(&entry.title),
+                    Printable(&entry.username)
+                );
             }
         }
         Command::Get { title, show } => {
             let entry = vault.get(&title)?;
-            println!("Title: {}", entry.title);
-            println!("Username: {}", entry.username);
+            println!("Title: {}", Printable(&entry.title));
+            println!("Username: {}", Printable(&entry.username));
             if let Some(url) = entry.url.as_deref().filter(|url| !url.is_empty()) {
-                println!("URL: {url}");
+                println!("URL: {}", Printable(url));
             }
             // Only this entry's password is decrypted, and wiped at the end
             // of this block.
             let password = entry.open_password(&key)?;
             if show {
-                println!("Password: {}", *password);
+                println!("Password: {}", Printable(&password));
             } else {
                 copy_temporarily(&password)?;
             }
@@ -723,10 +786,54 @@ fn ask_new_password(prompt: &str) -> AppResult<Zeroizing<String>> {
     }
     Ok(password)
 }
+
+/// Prompts twice for a new master password with hidden input. Fails if the
+/// two inputs differ, or if it is shorter than `MIN_MASTER_PASSWORD_CHARS`.
+fn ask_new_master_password() -> AppResult<Zeroizing<String>> {
+    let password = ask_new_password("New master password: ")?;
+    check_master_password(&password)?;
+    Ok(password)
+}
+
+/// Fails if `password` is too short to be a master password. Its length is not
+/// shown: it would tell something about the password.
+fn check_master_password(password: &str) -> AppResult {
+    // Characters, not bytes: "é" counts as one.
+    if password.chars().count() < MIN_MASTER_PASSWORD_CHARS {
+        let message = format!(
+            "the master password must be at least {MIN_MASTER_PASSWORD_CHARS} characters long"
+        );
+        return Err(message.into());
+    }
+    Ok(())
+}
+
+/// Shows text from the vault with each control character (escape sequence,
+/// line break...) replaced by `�`: an entry cannot drive the terminal, by
+/// changing its title, writing to the clipboard or hiding text. Writes
+/// straight to the output, one character at a time: no copy of the text is
+/// made, which matters for a password.
+struct Printable<'a>(&'a str);
+
+impl fmt::Display for Printable<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for c in self.0.chars() {
+            f.write_char(if c.is_control() {
+                char::REPLACEMENT_CHARACTER
+            } else {
+                c
+            })?;
+        }
+        Ok(())
+    }
+}
+
 /// Copies `secret` to the clipboard, waits, then clears it.
 ///
-/// The clipboard is only cleared if it still contains `secret`,
-/// so that anything copied by the user in the meantime is preserved.
+/// The clipboard is left as it is only if it was read back and holds
+/// something else: what the user copied in the meantime is preserved. If it
+/// cannot be read back, it is cleared all the same, rather than risk leaving
+/// the password in it.
 fn copy_temporarily(secret: &str) -> AppResult {
     let mut clipboard = arboard::Clipboard::new()?;
     clipboard.set_text(secret)?;
@@ -748,15 +855,26 @@ fn copy_temporarily(secret: &str) -> AppResult {
     println!();
 
     // The text read back may be the password: wipe it too.
-    let still_ours = clipboard
-        .get_text()
-        .is_ok_and(|current| *Zeroizing::new(current) == secret);
-    if still_ours {
-        debug!("clipboard still contains the password: overwriting it");
-        // Overwrite rather than clear: more reliable across clipboard bridges such as WSLg.
-        clipboard.set_text("")?;
-        println!("Clipboard cleared.");
+    let still_ours = match clipboard.get_text() {
+        Ok(current) => *Zeroizing::new(current) == secret,
+        Err(error) => {
+            debug!("could not read the clipboard back ({error}): clearing it all the same");
+            true
+        }
+    };
+    if !still_ours {
+        println!("The clipboard changed in the meantime: it was left as it is.");
+        return Ok(());
     }
+    debug!("clipboard may still contain the password: overwriting it");
+    // Overwrite rather than clear: more reliable across clipboard bridges such as WSLg.
+    clipboard.set_text("").map_err(|error| {
+        format!(
+            "could not clear the clipboard, which may still hold the password: \
+             clear it yourself ({error})"
+        )
+    })?;
+    println!("Clipboard cleared.");
     Ok(())
 }
 
@@ -775,4 +893,28 @@ fn init_logging(verbosity: u8) {
         .filter_module("argospass", level)
         .format(|buf, record| writeln!(buf, "[{:<5}] {}", record.level(), record.args()))
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn master_passwords_need_12_characters() {
+        assert!(check_master_password("12345678901").is_err());
+        assert!(check_master_password("123456789012").is_ok());
+        // Counted in characters: 11 accented letters are 22 bytes, but too short.
+        assert!(check_master_password(&"é".repeat(11)).is_err());
+        assert!(check_master_password(&"é".repeat(12)).is_ok());
+    }
+
+    #[test]
+    fn control_characters_are_never_printed() {
+        // An escape sequence (clear the screen), a line break, a C1 control
+        // character (CSI) and DEL.
+        let text = "a\u{1b}[2Jb\nc\u{9b}d\u{7f}e";
+        assert_eq!(Printable(text).to_string(), "a�[2Jb�c�d�e");
+        // Everything else is kept as it is.
+        assert_eq!(Printable("Gmail é 🔐").to_string(), "Gmail é 🔐");
+    }
 }

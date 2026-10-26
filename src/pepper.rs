@@ -19,7 +19,7 @@
 //! `cccc` is the check group: the first 2 bytes of the pepper id. A typo gives
 //! another pepper, whose id almost certainly does not start with these 2 bytes.
 
-use crate::{Error, Result, create_private_dir, hex, to_hex};
+use crate::{Error, Result, create_private_dir, hex, sync_parent_dir, to_hex};
 use log::{debug, info};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -337,21 +337,6 @@ fn warn_if_readable_by_others(path: &Path, metadata: &fs::Metadata) {
     }
     #[cfg(not(unix))]
     let _ = (path, metadata);
-}
-
-/// Flushes the directory entry of `path` to disk (Unix only).
-fn sync_parent_dir(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let parent = match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        fs::File::open(parent)?.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -8,8 +8,8 @@ pub mod pepper;
 
 pub use error::{Error, Result};
 
-use crypto::{ENVELOPE_LEN, KdfParams, NONCE_LEN, SALT_LEN, TAG_LEN, VaultKey};
-use format::{FORMAT_VERSION, HEADER_LEN, Header, MAGIC};
+use crypto::{ENVELOPE_LEN, NONCE_LEN, TAG_LEN, VaultKey};
+use format::{FORMAT_VERSION, HEADER_LEN, Header};
 use log::{debug, info, warn};
 use pepper::{PEPPER_ID_LEN, Pepper};
 use serde::de::Error as _;
@@ -24,8 +24,21 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 /// Size of an entry id: 16 bytes.
 pub const ENTRY_ID_LEN: usize = 16;
 
+/// Largest vault file accepted, in bytes (64 MiB): far more than any real
+/// vault needs, and small enough that a crafted file cannot exhaust memory.
+pub const MAX_VAULT_LEN: u64 = 64 * 1024 * 1024;
+
 /// Name of the password field, in the associated data of its encryption.
 const PASSWORD_FIELD: &str = "password";
+
+/// Suffix of the temporary file a file is written to before it replaces it.
+const TMP_SUFFIX: &str = ".tmp";
+
+/// Suffix of the backup of a vault: its previous version.
+const BACKUP_SUFFIX: &str = ".bak";
+
+/// Suffix of the lock file of a vault (see [`VaultLock`]).
+const LOCK_SUFFIX: &str = ".lock";
 
 /// Random id of an entry, drawn when the entry is created and never changed.
 /// Its protected fields are bound to it. Not secret: written in hex in the
@@ -138,51 +151,6 @@ impl Entry {
     }
 }
 
-/// An entry as stored before format v4, with its password in clear in the
-/// JSON content. Only read, to upgrade an old vault.
-#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
-struct LegacyEntry {
-    title: String,
-    username: String,
-    password: String,
-    url: Option<String>,
-}
-
-/// The JSON content of a vault before format v4.
-#[derive(Deserialize)]
-struct LegacyVault {
-    entries: Vec<LegacyEntry>,
-}
-
-impl LegacyVault {
-    /// Rewrites a vault opened from an older format in the current format.
-    ///
-    /// Everything is regenerated: new salt, current Argon2id parameters, the
-    /// pepper, a new random data key and a new vault id. The old key is never
-    /// reused: an old copy and the password would otherwise give the data key
-    /// without the pepper. Each entry gets an id, and its password is sealed
-    /// with the field key. The backup is replaced too, so that no copy in the
-    /// old format is left next to the vault.
-    ///
-    /// Entries are kept as they are, even two with the same title (possible in
-    /// a file edited by hand): the upgrade must not lock the owner out.
-    fn upgrade(self, path: &Path, password: &str, pepper: &Pepper) -> Result<(Vault, VaultKey)> {
-        let key = VaultKey::new(password, pepper)?;
-        let mut vault = Vault::new();
-        for entry in &self.entries {
-            vault.push_entry(
-                &key,
-                &entry.title,
-                &entry.username,
-                &entry.password,
-                entry.url.as_deref(),
-            )?;
-        }
-        vault.save_and_replace_backup(path, &key)?;
-        Ok((vault, key))
-    } // the old entries, with their passwords in clear, are wiped here
-}
-
 /// The vault: a collection of entries.
 #[derive(Default, Serialize, Deserialize)]
 pub struct Vault {
@@ -211,19 +179,6 @@ impl Vault {
         if self.entries.iter().any(|e| e.title == title) {
             return Err(Error::EntryAlreadyExists(title.to_string()));
         }
-        self.push_entry(key, title, username, password, url)
-    }
-
-    /// Adds an entry with a new random id and its password sealed with `key`,
-    /// without checking its title.
-    fn push_entry(
-        &mut self,
-        key: &VaultKey,
-        title: &str,
-        username: &str,
-        password: &str,
-        url: Option<&str>,
-    ) -> Result<()> {
         let id = EntryId::generate()?;
         let password = key.seal_field(id, PASSWORD_FIELD, password)?;
         self.entries.push(Entry {
@@ -309,55 +264,38 @@ impl Vault {
 
     /// Opens and decrypts a vault file with the master password and the pepper.
     ///
-    /// Only the JSON content is decrypted: each password stays encrypted until
-    /// [`Entry::open_password`]. Vaults in an older format (v3, v2, v1, or the
-    /// legacy format before them) are upgraded automatically to the current
-    /// format.
-    /// Fails with [`Error::PepperMismatch`] if the vault was created with
-    /// another pepper, and with [`Error::DecryptionFailed`] if the master
-    /// password is wrong or if the file has been modified.
+    /// The KEK derived from the master password and the pepper unwraps the
+    /// data key from the envelope, and the payload key derived from the data
+    /// key decrypts the payload. Only the JSON content is decrypted: each
+    /// password stays encrypted until [`Entry::open_password`].
+    ///
+    /// Only format v4 is opened: an older format fails with
+    /// [`Error::UnsupportedVersion`], or [`Error::BadMagic`] for the legacy
+    /// layout (which has no header), before any key derivation. Fails with
+    /// [`Error::PepperMismatch`] if the vault was created with another
+    /// pepper, and with [`Error::DecryptionFailed`] if the master password is
+    /// wrong or if the file has been modified.
     pub fn open(path: &Path, password: &str, pepper: &Pepper) -> Result<(Self, VaultKey)> {
-        let data = fs::read(path)?;
+        let data = read_vault_file(path)?;
         info!("opening vault");
         debug!("read {} bytes from {}", data.len(), path.display());
 
-        if !data.starts_with(MAGIC) {
-            return Self::open_legacy(path, password, pepper, &data);
-        }
-
         let header = Header::from_bytes(&data)?;
-        let (header_bytes, rest) = data.split_at(header.encoded_len());
-        debug!("format version {}, {:?}", header.version(), header.params);
+        debug!("format version {FORMAT_VERSION}, {:?}", header.params);
         debug!("salt (from file header): {}", to_hex(&header.salt));
-        if let Some(pepper_id) = header.pepper_id() {
-            debug!("pepper id (from file header): {}", to_hex(&pepper_id));
-        }
-        if let Some(vault_id) = header.vault_id() {
-            debug!("vault id (from file header): {}", to_hex(&vault_id));
-        }
+        debug!(
+            "pepper id (from file header): {}",
+            to_hex(&header.pepper_id())
+        );
+        debug!(
+            "vault id (from file header): {}",
+            to_hex(&header.vault_id())
+        );
 
-        match header.version() {
-            1 => Self::open_v1(path, password, pepper, &header, header_bytes, rest),
-            2 | 3 => Self::open_v2_v3(path, password, pepper, &header, rest),
-            FORMAT_VERSION => Self::open_envelope(password, header, rest, pepper),
-            // Already rejected by `Header::from_bytes`.
-            other => Err(Error::UnsupportedVersion(other)),
-        }
-    }
-
-    /// Opens a vault in the current format: `header || envelope || payload`.
-    ///
-    /// The KEK derived from the master password and the pepper unwraps the
-    /// data key from the envelope, and the payload key derived from the data
-    /// key decrypts the payload.
-    fn open_envelope(
-        password: &str,
-        header: Header,
-        rest: &[u8],
-        pepper: &Pepper,
-    ) -> Result<(Self, VaultKey)> {
+        // `from_bytes` checked that the whole header is there.
+        let rest = data.get(HEADER_LEN..).ok_or(Error::Truncated)?;
         let (envelope, payload) = split_envelope(rest)?;
-        let key = VaultKey::unlock(password, header, envelope, Some(pepper))?;
+        let key = VaultKey::unlock(password, header, envelope, pepper)?;
         let plaintext = key.decrypt(payload)?;
         let vault: Vault = serde_json::from_slice(&plaintext)?;
         info!(
@@ -367,84 +305,6 @@ impl Vault {
         Ok((vault, key))
     }
 
-    /// Opens a vault in format v2 or v3 (same layout as the current one, but
-    /// the data key itself encrypted the payload, and the passwords are in
-    /// clear inside it), then rewrites it in the current format.
-    fn open_v2_v3(
-        path: &Path,
-        password: &str,
-        pepper: &Pepper,
-        header: &Header,
-        rest: &[u8],
-    ) -> Result<(Self, VaultKey)> {
-        let (envelope, payload) = split_envelope(rest)?;
-        // The pepper is ignored for v2, which was derived without one.
-        let old: LegacyVault = {
-            let plaintext =
-                crypto::open_old_payload(password, header, envelope, payload, Some(pepper))?;
-            serde_json::from_slice(&plaintext)?
-        }; // the old data key and the decrypted JSON are wiped here
-        info!("vault decrypted: {} entries", old.entries.len());
-
-        warn!(
-            "vault uses format v{}: upgrading it to format v{FORMAT_VERSION}",
-            header.version()
-        );
-        old.upgrade(path, password, pepper)
-    }
-
-    /// Opens a vault in format v1 (`header || nonce || ciphertext || tag`,
-    /// encrypted with the key derived from the master password), then rewrites
-    /// it in the current format.
-    fn open_v1(
-        path: &Path,
-        password: &str,
-        pepper: &Pepper,
-        header: &Header,
-        header_bytes: &[u8],
-        encrypted: &[u8],
-    ) -> Result<(Self, VaultKey)> {
-        // The raw header bytes from the file are the associated data: they are
-        // exactly what v1 authenticated.
-        let old: LegacyVault = {
-            let key = crypto::derive_key(password, &header.salt, &header.params, None)?;
-            let plaintext = crypto::decrypt(&key, encrypted, header_bytes)?;
-            serde_json::from_slice(&plaintext)?
-        }; // the v1 key and the decrypted JSON are wiped here
-        info!("vault decrypted: {} entries", old.entries.len());
-
-        warn!("vault uses format v1: upgrading it to format v{FORMAT_VERSION}");
-        old.upgrade(path, password, pepper)
-    }
-
-    /// Opens a vault in the legacy layout (`salt || nonce || ciphertext || tag`,
-    /// fixed Argon2id parameters, no associated data), then rewrites it in the
-    /// current format.
-    fn open_legacy(
-        path: &Path,
-        password: &str,
-        pepper: &Pepper,
-        data: &[u8],
-    ) -> Result<(Self, VaultKey)> {
-        if data.len() < SALT_LEN {
-            return Err(Error::Truncated);
-        }
-
-        let (salt, encrypted) = data.split_at(SALT_LEN);
-        let salt: [u8; SALT_LEN] = salt.try_into().expect("length checked above");
-        debug!("legacy vault, salt: {}", to_hex(&salt));
-
-        let old: LegacyVault = {
-            let key = crypto::derive_key(password, &salt, &KdfParams::LEGACY, None)?;
-            let plaintext = crypto::decrypt(&key, encrypted, &[])?;
-            serde_json::from_slice(&plaintext)?
-        }; // the legacy key and the decrypted JSON are wiped here
-        info!("vault decrypted: {} entries", old.entries.len());
-
-        warn!("vault uses the legacy format: upgrading it to format v{FORMAT_VERSION}");
-        old.upgrade(path, password, pepper)
-    }
-
     /// Encrypts and writes the vault to a file.
     ///
     /// File layout: `header (66 bytes) || envelope (72 bytes) || nonce
@@ -452,6 +312,10 @@ impl Vault {
     /// encrypted with the payload key; the passwords inside it already are,
     /// with the field key. The header (see [`format`](mod@format)) and the
     /// envelope are authenticated as associated data.
+    ///
+    /// Fails with [`Error::VaultTooLarge`], before writing anything, if the
+    /// file would be larger than [`MAX_VAULT_LEN`]: it could not be opened
+    /// again.
     pub fn save(&self, path: &Path, key: &VaultKey) -> Result<()> {
         info!("saving vault ({} entries)", self.entries.len());
         let plaintext = self.to_json()?;
@@ -463,17 +327,26 @@ impl Vault {
 
         let mut data = key.prefix();
         data.extend_from_slice(&encrypted);
+        check_vault_len(data.len() as u64)?;
         write_atomic(path, &data)
     }
 
     /// Saves the vault, then replaces the backup with the new version, so that
     /// no file encrypted under the previous password is left next to the vault.
+    ///
+    /// Fails with [`Error::BackupNotReplaced`] if the vault was saved but its
+    /// backup could not be replaced: the backup then still holds the previous
+    /// version.
     pub fn save_and_replace_backup(&self, path: &Path, key: &VaultKey) -> Result<()> {
         self.save(path, key)?;
 
-        // `fs::copy` also copies the permission bits: the backup stays `600`.
-        let backup_path = sibling(path, ".bak");
-        fs::copy(path, &backup_path)?;
+        let backup_path = sibling(path, BACKUP_SUFFIX);
+        if let Err(source) = fs::read(path).and_then(|data| replace_file(&backup_path, &data)) {
+            return Err(Error::BackupNotReplaced {
+                path: backup_path,
+                source,
+            });
+        }
         debug!(
             "backup {} replaced with the new version",
             backup_path.display()
@@ -495,42 +368,108 @@ impl Vault {
     }
 }
 
-/// Tells whether the vault at `path` can only be opened with an existing
-/// pepper (format v3 and later).
-///
-/// Older formats return `false`: they are upgraded with the pepper when
-/// opened, so a missing pepper file may be created for them. The header is
-/// validated as by [`vault_pepper_id`]: a vault in a newer format, or with an
-/// invalid header, is an error, so that no pepper is created for it. Nothing is
-/// authenticated yet.
-pub fn requires_existing_pepper(path: &Path) -> Result<bool> {
-    Ok(vault_pepper_id(path)?.is_some())
-}
-
-/// Returns the id of the pepper the vault at `path` was created with, or
-/// `None` for a vault in a format older than v3 (which has no pepper yet).
+/// Returns the id of the pepper the vault at `path` was created with.
 ///
 /// Only the header is read and validated, as [`Vault::open`] does before any
-/// key derivation: nothing is decrypted, so no password is needed. The id is
-/// not authenticated yet: a tampered id is only detected when the vault is
-/// opened.
-pub fn vault_pepper_id(path: &Path) -> Result<Option<[u8; PEPPER_ID_LEN]>> {
-    let start = read_header_bytes(path)?;
-    if !start.starts_with(MAGIC) {
-        // The legacy layout has no header (and no pepper).
-        return Ok(None);
-    }
-    Ok(Header::from_bytes(&start)?.pepper_id())
+/// key derivation: nothing is decrypted, so no password is needed. A vault in
+/// another format fails as it would when opened. The id is not authenticated
+/// yet: a tampered id is only detected when the vault is opened.
+pub fn vault_pepper_id(path: &Path) -> Result<[u8; PEPPER_ID_LEN]> {
+    Ok(Header::from_bytes(&read_header_bytes(path)?)?.pepper_id())
 }
 
-/// Reads the first bytes of the file at `path`, up to the length of a header
-/// in the current format.
+/// Reads the first bytes of the file at `path`, up to the length of a header.
 fn read_header_bytes(path: &Path) -> Result<Vec<u8>> {
     let mut start = Vec::with_capacity(HEADER_LEN);
     fs::File::open(path)?
         .take(HEADER_LEN as u64)
         .read_to_end(&mut start)?;
     Ok(start)
+}
+
+/// Reads the whole vault file at `path`. Fails with [`Error::VaultTooLarge`]
+/// if it is larger than [`MAX_VAULT_LEN`], before reading it.
+fn read_vault_file(path: &Path) -> Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    check_vault_len(file.metadata()?.len())?;
+
+    // Bounded all the same: the size given by the metadata may change, and
+    // means nothing for a pipe or a device.
+    let mut data = Vec::new();
+    file.take(MAX_VAULT_LEN + 1).read_to_end(&mut data)?;
+    check_vault_len(data.len() as u64)?;
+    Ok(data)
+}
+
+/// Fails with [`Error::VaultTooLarge`] if a vault file of `len` bytes is
+/// larger than [`MAX_VAULT_LEN`].
+fn check_vault_len(len: u64) -> Result<()> {
+    if len > MAX_VAULT_LEN {
+        return Err(Error::VaultTooLarge(len));
+    }
+    Ok(())
+}
+
+/// Every file ArgosPass writes for the vault at `path`: the vault, its
+/// backup, the temporary files they are written through, and the lock file.
+///
+/// No other file, such as the pepper, may have one of these paths: saving the
+/// vault would overwrite it.
+pub fn vault_files(path: &Path) -> [PathBuf; 5] {
+    let backup = sibling(path, BACKUP_SUFFIX);
+    [
+        path.to_path_buf(),
+        sibling(path, TMP_SUFFIX),
+        sibling(&backup, TMP_SUFFIX),
+        backup,
+        sibling(path, LOCK_SUFFIX),
+    ]
+}
+
+/// An exclusive lock on a vault, for a command that changes it: held from
+/// reading the vault to saving it, so that two commands cannot each save their
+/// own version and lose the other one's changes. Released when dropped.
+///
+/// The lock is taken on a `.lock` file next to the vault, which stays there:
+/// it is never written to, nor removed (two commands could otherwise lock two
+/// different files).
+pub struct VaultLock {
+    // Only kept for the lock: closing the file releases it.
+    _file: fs::File,
+}
+
+impl VaultLock {
+    /// Locks the vault at `path`. Fails with [`Error::VaultBusy`] if another
+    /// command holds the lock, rather than waiting for it.
+    ///
+    /// On a file system without file locks (some network drives), goes on
+    /// without one, and logs a warning.
+    pub fn acquire(path: &Path) -> Result<Self> {
+        let lock_path = sibling(path, LOCK_SUFFIX);
+        let mut options = fs::OpenOptions::new();
+        // Created if needed, but never truncated: the file stays empty.
+        options.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&lock_path)?;
+
+        match file.try_lock() {
+            Ok(()) => debug!("locked {}", lock_path.display()),
+            Err(fs::TryLockError::WouldBlock) => return Err(Error::VaultBusy),
+            Err(fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => {
+                warn!(
+                    "{} cannot be locked (the file system does not support it): \
+                     do not run two commands that change the vault at the same time",
+                    lock_path.display()
+                );
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        Ok(Self { _file: file })
+    }
 }
 
 /// Creates `dir` and its parents if needed.
@@ -544,6 +483,22 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
         builder.mode(0o700);
     }
     builder.create(dir)
+}
+
+/// Flushes the directory entry of `path` to disk, so that a file just created
+/// or renamed there is still there after a crash (Unix only).
+pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// A writer that discards its input and only counts the bytes written.
@@ -590,17 +545,39 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Writes `data` to `path` without ever leaving a partially written file.
-///
-/// The data is written to a temporary file, flushed to disk, then renamed over
-/// the destination. The previous version is kept as a `.bak` file.
-/// On Unix, the file is created with `600` permissions (owner read/write only).
+/// Writes `data` to `path` without ever leaving a partially written file (see
+/// [`replace_file`]). The previous version, if any, is kept first as the
+/// `.bak` backup, replaced the same way.
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let tmp_path = sibling(path, ".tmp");
-    let backup_path = sibling(path, ".bak");
+    if path.exists() {
+        let backup_path = sibling(path, BACKUP_SUFFIX);
+        replace_file(&backup_path, &fs::read(path)?)?;
+        debug!("previous version backed up to {}", backup_path.display());
+    }
+    replace_file(path, data)?;
+    Ok(())
+}
+
+/// Replaces the content of `path` with `data` atomically: `data` is written to
+/// a temporary file, flushed to disk, then renamed over `path`. At any moment,
+/// `path` holds either its old content or the new one, never a partially
+/// written file.
+///
+/// The temporary file is always a new file, never one found in its place: a
+/// leftover file could keep other permissions, or be a link to another file.
+/// On Unix, it is created with `600` permissions (owner read/write only).
+fn replace_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    let tmp_path = sibling(path, TMP_SUFFIX);
+    match fs::remove_file(&tmp_path) {
+        Ok(()) => debug!("removed the leftover file {}", tmp_path.display()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
 
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    // `create_new` fails if anything (even a link) appeared at this path in
+    // the meantime, instead of writing through it.
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -615,11 +592,9 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     } // the file is closed here
     debug!("data flushed to disk (fsync)");
 
-    if path.exists() {
-        fs::copy(path, &backup_path)?;
-        debug!("previous version backed up to {}", backup_path.display());
-    }
     fs::rename(&tmp_path, path)?;
+    // The rename itself only survives a crash once the directory is flushed.
+    sync_parent_dir(path)?;
     debug!(
         "atomically renamed {} -> {}",
         tmp_path.display(),
@@ -713,7 +688,10 @@ mod tests {
             (id.as_str(), "zz"),
         ] {
             let result = serde_json::from_str::<Vault>(&entry(id, field));
-            assert!(matches!(result.map_err(Error::from), Err(Error::Json(_))));
+            assert!(matches!(
+                result.map_err(Error::from),
+                Err(Error::Json { .. })
+            ));
         }
     }
 
@@ -837,6 +815,29 @@ mod tests {
         for (path, expected) in cases {
             assert_eq!(sibling(Path::new(path), ".bak"), Path::new(expected));
         }
+    }
+
+    #[test]
+    fn vault_files_are_all_the_files_written_next_to_the_vault() {
+        let files = vault_files(Path::new("dir/vault.argos"));
+        let expected = [
+            "dir/vault.argos",
+            "dir/vault.argos.tmp",
+            "dir/vault.argos.bak.tmp",
+            "dir/vault.argos.bak",
+            "dir/vault.argos.lock",
+        ];
+        assert_eq!(files, expected.map(PathBuf::from));
+    }
+
+    #[test]
+    fn vault_files_up_to_64_mib_are_accepted() {
+        assert!(check_vault_len(0).is_ok());
+        assert!(check_vault_len(MAX_VAULT_LEN).is_ok());
+        assert!(matches!(
+            check_vault_len(MAX_VAULT_LEN + 1),
+            Err(Error::VaultTooLarge(len)) if len == MAX_VAULT_LEN + 1
+        ));
     }
 
     #[test]

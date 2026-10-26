@@ -1,10 +1,12 @@
 //! Integration tests: encrypted vault file round-trips.
 
-use argospass::crypto::VaultKey;
-use argospass::crypto::{ENVELOPE_LEN, KEY_LEN, KdfParams, SALT_LEN, decrypt, derive_key, encrypt};
-use argospass::format::{HEADER_LEN, HEADER_LEN_V2, HEADER_LEN_V3, Header, MAGIC};
+use argon2::{Algorithm, Argon2, Params, Version};
+use argospass::crypto::{ENVELOPE_LEN, KEY_LEN, NONCE_LEN, SALT_LEN, VaultKey};
+use argospass::format::{HEADER_LEN, Header, MAGIC};
 use argospass::pepper::{Installed, PEPPER_ID_LEN, Pepper, short_id};
-use argospass::{Error, Vault, requires_existing_pepper, vault_pepper_id};
+use argospass::{Error, MAX_VAULT_LEN, Vault, VaultLock, vault_pepper_id};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::fs;
@@ -12,10 +14,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-/// Offset of the pepper id in a v3 or v4 header.
+/// Offset of the pepper id in the header.
 const PEPPER_ID_OFFSET: usize = 34;
 
-/// Offset of the vault id in a v4 header.
+/// Offset of the vault id in the header.
 const VAULT_ID_OFFSET: usize = 50;
 
 /// Returns a path in the system temp directory, unique to each test.
@@ -34,11 +36,19 @@ fn temp_pepper_path(name: &str) -> PathBuf {
 /// Creates a pepper in its own temporary file, unique to each test, and reads
 /// it back. The file is deleted right away: the tests only need the pepper.
 fn temp_pepper(name: &str) -> Pepper {
+    temp_pepper_with_bytes(name).0
+}
+
+/// Creates a pepper as [`temp_pepper`] does, and also returns the 32 bytes of
+/// its file: Argon2id's secret, for the tests that open a vault without the
+/// library.
+fn temp_pepper_with_bytes(name: &str) -> (Pepper, Vec<u8>) {
     let path = temp_pepper_path(name);
     Pepper::create(&path).expect("pepper creation should succeed");
     let pepper = Pepper::load(&path).expect("pepper should load");
+    let bytes = fs::read(&path).expect("read should succeed");
     fs::remove_file(&path).expect("cleanup should succeed");
-    pepper
+    (pepper, bytes)
 }
 
 #[test]
@@ -146,13 +156,20 @@ fn second_save_keeps_previous_version_as_backup() {
 #[test]
 fn save_leaves_no_temporary_file() {
     let path = temp_vault("no-tmp");
+    let backup = path.with_extension("argos.bak");
     let pepper = temp_pepper("no-tmp");
     let key = VaultKey::new("master", &pepper).expect("key derivation should succeed");
-    Vault::new().save(&path, &key).expect("save should succeed");
+    // Twice: the second save also writes the backup, through its own
+    // temporary file.
+    for _ in 0..2 {
+        Vault::new().save(&path, &key).expect("save should succeed");
+    }
 
     assert!(!path.with_extension("argos.tmp").exists());
+    assert!(!path.with_extension("argos.bak.tmp").exists());
 
     fs::remove_file(&path).expect("cleanup should succeed");
+    fs::remove_file(&backup).expect("cleanup should succeed");
 }
 
 #[cfg(unix)]
@@ -169,6 +186,43 @@ fn vault_file_is_readable_by_owner_only() {
     assert_eq!(mode & 0o777, 0o600);
 
     fs::remove_file(&path).expect("cleanup should succeed");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_leftover_temporary_file_is_replaced_not_written_through() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let path = temp_vault("leftover-tmp");
+    let tmp = path.with_extension("argos.tmp");
+    let target = temp_vault("leftover-tmp-target");
+    let pepper = temp_pepper("leftover-tmp");
+    let key = VaultKey::new("master", &pepper).expect("key derivation should succeed");
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&tmp);
+
+    // A leftover that everyone can read: the vault must not inherit its
+    // permissions.
+    fs::write(&tmp, b"leftover").expect("write should succeed");
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).expect("chmod should succeed");
+    Vault::new().save(&path, &key).expect("save should succeed");
+    let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(!tmp.exists());
+
+    // A link to another file: that file must not be written to.
+    fs::write(&target, b"not the vault").expect("write should succeed");
+    symlink(&target, &tmp).expect("symlink should succeed");
+    Vault::new().save(&path, &key).expect("save should succeed");
+    assert_eq!(
+        fs::read(&target).expect("read should succeed"),
+        b"not the vault"
+    );
+    assert!(Vault::open(&path, "master", &pepper).is_ok());
+
+    for file in [path.clone(), path.with_extension("argos.bak"), target] {
+        fs::remove_file(file).expect("cleanup should succeed");
+    }
 }
 
 #[test]
@@ -269,9 +323,9 @@ fn truncated_vault_fails_to_open() {
     // Cut in the middle of the header, before or inside the ids...
     for len in [
         10,
-        HEADER_LEN_V2,
-        HEADER_LEN_V3 - 1,
-        HEADER_LEN_V3,
+        PEPPER_ID_OFFSET,
+        VAULT_ID_OFFSET - 1,
+        VAULT_ID_OFFSET,
         HEADER_LEN - 1,
     ] {
         fs::write(&path, &data[..len]).expect("write should succeed");
@@ -292,6 +346,25 @@ fn truncated_vault_fails_to_open() {
 }
 
 #[test]
+fn too_large_vault_file_is_refused_before_being_read() {
+    let path = temp_vault("too-large");
+    let pepper = temp_pepper("too-large");
+
+    // A sparse file: that large, without taking the space on disk.
+    let file = fs::File::create(&path).expect("create should succeed");
+    file.set_len(MAX_VAULT_LEN + 1)
+        .expect("set_len should succeed");
+    drop(file);
+
+    assert!(matches!(
+        Vault::open(&path, "master", &pepper),
+        Err(Error::VaultTooLarge(len)) if len == MAX_VAULT_LEN + 1
+    ));
+
+    fs::remove_file(&path).expect("cleanup should succeed");
+}
+
+#[test]
 fn missing_vault_is_an_io_error() {
     let path = temp_vault("missing");
     let pepper = temp_pepper("missing");
@@ -303,47 +376,122 @@ fn missing_vault_is_an_io_error() {
     ));
 }
 
+/// Builds the header fields up to the salt, with the weakest accepted
+/// parameters: the whole header of a vault in format v1 or v2, which v3
+/// extended with the pepper id, and v4 with the vault id.
+fn old_header(version: u8, salt: &[u8; SALT_LEN]) -> Vec<u8> {
+    let mut header = MAGIC.to_vec();
+    header.push(version);
+    header.extend_from_slice(&(64 * 1024u32).to_le_bytes());
+    header.extend_from_slice(&3u32.to_le_bytes());
+    header.extend_from_slice(&1u32.to_le_bytes());
+    header.extend_from_slice(salt);
+    header
+}
+
+/// A vault in format v1, as someone who knows the master password but not
+/// the pepper could forge it: `header || nonce || ciphertext || tag`, the JSON
+/// encrypted with the key that Argon2id derives from the password alone, with
+/// the header as associated data.
+fn forged_v1_vault(password: &str, json: &[u8]) -> Vec<u8> {
+    let salt = [7u8; SALT_LEN];
+    let mut vault = old_header(1, &salt);
+    let params = Params::new(64 * 1024, 3, 1, Some(KEY_LEN)).expect("valid parameters");
+    let mut key = [0u8; KEY_LEN];
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password_into(password.as_bytes(), &salt, &mut key)
+        .expect("derivation");
+
+    let mut nonce = [0u8; NONCE_LEN];
+    getrandom::fill(&mut nonce).expect("random nonce");
+    let ciphertext = XChaCha20Poly1305::new(Key::from_slice(&key))
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: json,
+                aad: &vault,
+            },
+        )
+        .expect("encryption");
+    vault.extend_from_slice(&nonce);
+    vault.extend_from_slice(&ciphertext);
+    vault
+}
+
 #[test]
-fn legacy_vault_is_upgraded() {
-    let path = temp_vault("legacy");
-    let backup = path.with_extension("argos.bak");
-    let pepper = temp_pepper("legacy");
-    let other = temp_pepper("legacy-other");
+fn a_forged_vault_in_an_older_format_is_refused() {
+    // Someone who knows the master password, but not the pepper, and can
+    // write the vault file (a synced folder) replaces the vault with a v1 one
+    // of their own. Earlier builds opened it, then re-encrypted it under the
+    // pepper.
+    let path = temp_vault("forged-v1");
+    let pepper = temp_pepper("forged-v1");
+    let key = VaultKey::new("master", &pepper).expect("key derivation should succeed");
+    let mut vault = Vault::new();
+    vault
+        .add(
+            &key,
+            "Bank",
+            "alice",
+            "real-secret",
+            Some("https://bank.example"),
+        )
+        .expect("add should succeed");
+    vault.save(&path, &key).expect("save should succeed");
 
-    // Build a vault in the pre-v1 layout: salt || nonce || ciphertext || tag.
-    let salt = [9u8; SALT_LEN];
-    let key = derive_key("master", &salt, &KdfParams::LEGACY, None).expect("derivation");
-    let json =
-        br#"{"entries":[{"title":"Gmail","username":"me","password":"legacy-secret","url":null}]}"#;
-    let encrypted = encrypt(&key, json, &[]).expect("encryption");
-    let mut legacy = salt.to_vec();
-    legacy.extend_from_slice(&encrypted);
-    fs::write(&path, &legacy).expect("write should succeed");
-    assert!(!requires_existing_pepper(&path).expect("read should succeed"));
-
-    // A wrong password must not upgrade (nor touch) the file.
-    assert!(matches!(
-        Vault::open(&path, "not the master", &pepper),
-        Err(Error::DecryptionFailed)
-    ));
-    assert_eq!(fs::read(&path).expect("read should succeed"), legacy);
-
-    let (vault, key) = Vault::open(&path, "master", &pepper).expect("legacy vault should open");
-    let entry = vault.get("Gmail").expect("entry should exist");
-    let password = entry.open_password(&key).expect("the password should open");
-    assert!(*password == "legacy-secret");
-
-    assert!(
-        fs::read(&path)
-            .expect("read should succeed")
-            .starts_with(MAGIC)
+    let forged = forged_v1_vault(
+        "master",
+        br#"{"entries":[{"title":"Bank","username":"alice","password":"chosen","url":"https://evil.example"}]}"#,
     );
-    assert_upgraded_to_v4(&path, &backup, &pepper, &other);
-    let (_, json) = open_layers(&path, "master", &pepper);
-    assert!(!contains(&json, b"legacy-secret"));
+    fs::write(&path, &forged).expect("write should succeed");
+
+    // The right password and the right pepper: refused all the same, and left
+    // as it is.
+    assert!(matches!(
+        Vault::open(&path, "master", &pepper),
+        Err(Error::UnsupportedVersion(1))
+    ));
+    assert_eq!(fs::read(&path).expect("read should succeed"), forged);
 
     fs::remove_file(&path).expect("cleanup should succeed");
-    fs::remove_file(&backup).expect("cleanup should succeed");
+}
+
+#[test]
+fn older_formats_are_refused_and_left_unchanged() {
+    let path = temp_vault("older-formats");
+    let backup = path.with_extension("argos.bak");
+    let pepper = temp_pepper("older-formats");
+    let salt = [7u8; SALT_LEN];
+    let _ = fs::remove_file(&backup);
+
+    // Each one followed by plausible content: refused from its header alone,
+    // or from its first bytes for the legacy layout, which has no header.
+    let mut v3 = old_header(3, &salt);
+    v3.extend_from_slice(&pepper.id());
+    let cases = [
+        (vec![0x55u8; SALT_LEN], None),
+        (old_header(1, &salt), Some(1)),
+        (old_header(2, &salt), Some(2)),
+        (v3, Some(3)),
+    ];
+    for (mut data, version) in cases {
+        data.extend_from_slice(&[0xaa; ENVELOPE_LEN + 24 + 14 + 16]);
+        fs::write(&path, &data).expect("write should succeed");
+
+        let result = Vault::open(&path, "master", &pepper);
+        match version {
+            Some(version) => assert!(matches!(
+                result,
+                Err(Error::UnsupportedVersion(found)) if found == version
+            )),
+            None => assert!(matches!(result, Err(Error::BadMagic))),
+        }
+        // Nothing is written: no upgrade, no backup.
+        assert_eq!(fs::read(&path).expect("read should succeed"), data);
+        assert!(!backup.exists());
+    }
+
+    fs::remove_file(&path).expect("cleanup should succeed");
 }
 
 #[test]
@@ -358,7 +506,10 @@ fn new_vault_uses_format_v4() {
     // header 66 + envelope 72 + nonce 24 + `{"entries":[]}` 14 + tag 16
     assert_eq!(data.len(), 192);
     assert_eq!(&data[PEPPER_ID_OFFSET..VAULT_ID_OFFSET], &pepper.id());
-    assert!(requires_existing_pepper(&path).expect("read should succeed"));
+    assert_eq!(
+        vault_pepper_id(&path).expect("read should succeed"),
+        pepper.id()
+    );
 
     // The vault id, at offset 50: random, so another vault has another one.
     let other_path = temp_vault("format-v4-other");
@@ -396,250 +547,50 @@ fn tampered_envelope_is_rejected() {
     fs::remove_file(&path).expect("cleanup should succeed");
 }
 
-/// Builds the header fields up to the salt, with the weakest accepted
-/// parameters so that the tests stay fast: the whole header of a v1 or v2
-/// vault, which later versions extend.
-fn old_header(version: u8, salt: &[u8; SALT_LEN]) -> Vec<u8> {
-    let mut header = MAGIC.to_vec();
-    header.push(version);
-    header.extend_from_slice(&(64 * 1024u32).to_le_bytes());
-    header.extend_from_slice(&3u32.to_le_bytes());
-    header.extend_from_slice(&1u32.to_le_bytes());
-    header.extend_from_slice(salt);
-    assert_eq!(header.len(), HEADER_LEN_V2);
-    header
-}
-
-/// Checks that an upgraded vault and its backup are in format v4, with the
-/// id of `pepper`, and only open with it.
-fn assert_upgraded_to_v4(path: &Path, backup: &Path, pepper: &Pepper, other: &Pepper) {
-    for file in [path, backup] {
-        let data = fs::read(file).expect("read should succeed");
-        assert_eq!(data[5], 4);
-        assert_eq!(&data[PEPPER_ID_OFFSET..VAULT_ID_OFFSET], &pepper.id());
-        assert!(requires_existing_pepper(file).expect("read should succeed"));
-
-        assert!(Vault::open(file, "master", pepper).is_ok());
-        assert!(matches!(
-            Vault::open(file, "master", other),
-            Err(Error::PepperMismatch { .. })
-        ));
-    }
-}
-
-/// Writes a vault in format v1 holding `json`, with "master" as its password:
-/// header || nonce || ciphertext || tag, encrypted with the Argon2id key
-/// itself and the header as AAD. Returns the bytes written.
-fn write_v1_vault(path: &Path, json: &[u8]) -> Vec<u8> {
-    let salt = [7u8; SALT_LEN];
-    let mut v1 = old_header(1, &salt);
-    let key = derive_key("master", &salt, &KdfParams::MINIMUM, None).expect("derivation");
-    let encrypted = encrypt(&key, json, &v1).expect("encryption");
-    v1.extend_from_slice(&encrypted);
-    fs::write(path, &v1).expect("write should succeed");
-    v1
-}
-
-#[test]
-fn v1_vault_is_upgraded_to_v4() {
-    let path = temp_vault("v1-upgrade");
-    let backup = path.with_extension("argos.bak");
-    let pepper = temp_pepper("v1-upgrade");
-    let other = temp_pepper("v1-upgrade-other");
-
-    let v1 = write_v1_vault(
-        &path,
-        br#"{"entries":[{"title":"Gmail","username":"me","password":"v1-secret","url":null}]}"#,
-    );
-
-    // A wrong password must not upgrade (nor touch) the file.
-    assert!(matches!(
-        Vault::open(&path, "not the master", &pepper),
-        Err(Error::DecryptionFailed)
-    ));
-    assert_eq!(fs::read(&path).expect("read should succeed"), v1);
-
-    let (vault, key) = Vault::open(&path, "master", &pepper).expect("v1 vault should open");
-    let entry = vault.get("Gmail").expect("entry should exist");
-    let password = entry.open_password(&key).expect("the password should open");
-    assert!(*password == "v1-secret");
-
-    assert_upgraded_to_v4(&path, &backup, &pepper, &other);
-    let (_, json) = open_layers(&path, "master", &pepper);
-    assert!(!contains(&json, b"v1-secret"));
-
-    fs::remove_file(&path).expect("cleanup should succeed");
-    fs::remove_file(&backup).expect("cleanup should succeed");
-}
-
-#[test]
-fn upgrade_keeps_entries_with_the_same_title() {
-    let path = temp_vault("upgrade-same-title");
-    let backup = path.with_extension("argos.bak");
-    let pepper = temp_pepper("upgrade-same-title");
-
-    // `add` refuses a second entry with the same title, but a file edited by
-    // hand may have one: the upgrade keeps both rather than fail, which would
-    // leave the vault impossible to open.
-    write_v1_vault(
-        &path,
-        br#"{"entries":[
-            {"title":"Gmail","username":"first","password":"first-secret","url":null},
-            {"title":"Gmail","username":"second","password":"second-secret","url":null}
-        ]}"#,
-    );
-
-    Vault::open(&path, "master", &pepper).expect("the upgrade should succeed");
-    let (vault, key) =
-        Vault::open(&path, "master", &pepper).expect("the upgraded vault should open");
-    assert_eq!(vault.list().len(), 2);
-    let expected = [("first", "first-secret"), ("second", "second-secret")];
-    for (entry, (username, secret)) in vault.list().iter().zip(expected) {
-        assert_eq!(entry.username, username);
-        let password = entry.open_password(&key).expect("the password should open");
-        assert!(*password == secret);
-    }
-
-    fs::remove_file(&path).expect("cleanup should succeed");
-    fs::remove_file(&backup).expect("cleanup should succeed");
-}
-
-#[test]
-fn v2_vault_is_upgraded_to_v4() {
-    let path = temp_vault("v2-upgrade");
-    let backup = path.with_extension("argos.bak");
-    let pepper = temp_pepper("v2-upgrade");
-    let other = temp_pepper("v2-upgrade-other");
-
-    // Build a vault in format v2 (no pepper): header || envelope || payload.
-    // The KEK wraps the data key with the header as AAD, and the data key
-    // encrypts the JSON with `header || envelope` as AAD.
-    let salt = [7u8; SALT_LEN];
-    let mut v2 = old_header(2, &salt);
-    let kek = derive_key("master", &salt, &KdfParams::MINIMUM, None).expect("derivation");
-    let data_key = [5u8; KEY_LEN];
-    let envelope = encrypt(&kek, &data_key, &v2).expect("encryption");
-    assert_eq!(envelope.len(), ENVELOPE_LEN);
-    v2.extend_from_slice(&envelope);
-    let json = br#"{"entries":[{"title":"Gmail","username":"me","password":"secret","url":null}]}"#;
-    let payload = encrypt(&data_key, json, &v2).expect("encryption");
-    v2.extend_from_slice(&payload);
-    fs::write(&path, &v2).expect("write should succeed");
-    assert!(!requires_existing_pepper(&path).expect("read should succeed"));
-
-    // A wrong password must not upgrade (nor touch) the file.
-    assert!(matches!(
-        Vault::open(&path, "not the master", &pepper),
-        Err(Error::DecryptionFailed)
-    ));
-    assert_eq!(fs::read(&path).expect("read should succeed"), v2);
-
-    let (vault, key) = Vault::open(&path, "master", &pepper).expect("v2 vault should open");
-    let entry = vault.get("Gmail").expect("entry should exist");
-    let password = entry.open_password(&key).expect("the password should open");
-    assert!(*password == "secret");
-
-    // No copy without the pepper is left: the backup was replaced too.
-    assert_upgraded_to_v4(&path, &backup, &pepper, &other);
-    // A new data key, and the password is no longer in clear in the JSON.
-    let (new_data_key, json) = open_layers(&path, "master", &pepper);
-    assert!(new_data_key != data_key);
-    assert!(!contains(&json, b"secret"));
-
-    fs::remove_file(&path).expect("cleanup should succeed");
-    fs::remove_file(&backup).expect("cleanup should succeed");
-}
-
-#[test]
-fn v3_vault_with_entries_is_upgraded_to_v4() {
-    let path = temp_vault("v3-upgrade");
-    let backup = path.with_extension("argos.bak");
-    let pepper = temp_pepper("v3-upgrade");
-    let other = temp_pepper("v3-upgrade-other");
-
-    // Build a vault in format v3: the v2 layout, with the pepper id at the
-    // end of the header and the pepper in the KEK. The data key itself
-    // encrypts the JSON, where the passwords are in clear.
-    let salt = [7u8; SALT_LEN];
-    let mut v3 = old_header(3, &salt);
-    v3.extend_from_slice(&pepper.id());
-    assert_eq!(v3.len(), HEADER_LEN_V3);
-    let kek = derive_key("master", &salt, &KdfParams::MINIMUM, Some(&pepper)).expect("derivation");
-    let data_key = [5u8; KEY_LEN];
-    let envelope = encrypt(&kek, &data_key, &v3).expect("encryption");
-    v3.extend_from_slice(&envelope);
-    let json = br#"{"entries":[
-        {"title":"Gmail","username":"me","password":"first-secret","url":null},
-        {"title":"GitHub","username":"me","password":"second-secret","url":"https://github.com"}
-    ]}"#;
-    let payload = encrypt(&data_key, json, &v3).expect("encryption");
-    v3.extend_from_slice(&payload);
-    fs::write(&path, &v3).expect("write should succeed");
-    assert!(requires_existing_pepper(&path).expect("read should succeed"));
-
-    // A wrong password or pepper must not upgrade (nor touch) the file.
-    assert!(matches!(
-        Vault::open(&path, "not the master", &pepper),
-        Err(Error::DecryptionFailed)
-    ));
-    assert!(matches!(
-        Vault::open(&path, "master", &other),
-        Err(Error::PepperMismatch { .. })
-    ));
-    assert_eq!(fs::read(&path).expect("read should succeed"), v3);
-
-    let (vault, key) = Vault::open(&path, "master", &pepper).expect("v3 vault should open");
-    assert_upgraded_to_v4(&path, &backup, &pepper, &other);
-
-    // Every password is still there, as `get` reads it: in the vault just
-    // upgraded, and in the upgraded file opened again.
-    let (reopened, reopened_key) =
-        Vault::open(&path, "master", &pepper).expect("the upgraded vault should open");
-    for (title, expected) in [("Gmail", "first-secret"), ("GitHub", "second-secret")] {
-        for (vault, key) in [(&vault, &key), (&reopened, &reopened_key)] {
-            let entry = vault.get(title).expect("entry should exist");
-            let password = entry.open_password(key).expect("the password should open");
-            assert!(*password == expected);
-        }
-    }
-    let github = reopened.get("GitHub").expect("entry should exist");
-    assert_eq!(github.url.as_deref(), Some("https://github.com"));
-
-    // A new data key, and no password left in clear in the decrypted JSON.
-    let (new_data_key, json) = open_layers(&path, "master", &pepper);
-    assert!(new_data_key != data_key);
-    for password in [b"first-secret".as_slice(), b"second-secret"] {
-        assert!(!contains(&json, password));
-    }
-
-    fs::remove_file(&path).expect("cleanup should succeed");
-    fs::remove_file(&backup).expect("cleanup should succeed");
-}
-
-/// Opens the two outer layers of a v4 vault without the library's
-/// `VaultKey`, from the documented format alone: Argon2id gives the KEK, which
-/// opens the envelope (AAD: header) and gives the data key; HKDF-SHA256 gives
-/// the payload key, which decrypts the payload (AAD: header || envelope).
-/// Returns the data key and the decrypted JSON: level 1 only.
-fn open_layers(path: &Path, password: &str, pepper: &Pepper) -> ([u8; KEY_LEN], Vec<u8>) {
+/// Opens the two outer layers of a vault without the library, from the
+/// documented format and the primitives alone: Argon2id, with the pepper as
+/// its secret, gives the KEK, which opens the envelope (AAD: header) and gives
+/// the data key; HKDF-SHA256 gives the payload key, which decrypts the payload
+/// (AAD: header || envelope). Returns the data key and the decrypted JSON:
+/// level 1 only.
+fn open_layers(path: &Path, password: &str, pepper: &[u8]) -> ([u8; KEY_LEN], Vec<u8>) {
     let data = fs::read(path).expect("read should succeed");
-    assert_eq!(data[5], 4);
     let header = Header::from_bytes(&data).expect("valid header");
     let (prefix, payload) = data.split_at(HEADER_LEN + ENVELOPE_LEN);
     let (header_bytes, envelope) = prefix.split_at(HEADER_LEN);
 
-    let kek = derive_key(password, &header.salt, &header.params, Some(pepper)).expect("derivation");
-    let data_key: [u8; KEY_LEN] = decrypt(&kek, envelope, header_bytes)
-        .expect("the envelope should open")
-        .as_slice()
+    let p = header.params;
+    let params = Params::new(p.memory_kib, p.iterations, p.parallelism, Some(KEY_LEN))
+        .expect("valid parameters");
+    let mut kek = [0u8; KEY_LEN];
+    Argon2::new_with_secret(pepper, Algorithm::Argon2id, Version::V0x13, params)
+        .expect("valid secret")
+        .hash_password_into(password.as_bytes(), &header.salt, &mut kek)
+        .expect("derivation");
+
+    let data_key: [u8; KEY_LEN] = aead_open(&kek, envelope, header_bytes)
         .try_into()
         .expect("a 32-byte data key");
     let mut payload_key = [0u8; KEY_LEN];
     Hkdf::<Sha256>::new(None, &data_key)
         .expand(b"ArgosPass payload key v1", &mut payload_key)
         .expect("HKDF");
-    let json = decrypt(&payload_key, payload, prefix).expect("the payload should open");
-    (data_key, json.to_vec())
+    let json = aead_open(&payload_key, payload, prefix);
+    (data_key, json)
+}
+
+/// Decrypts `nonce (24) || ciphertext || tag (16)` with XChaCha20-Poly1305.
+fn aead_open(key: &[u8; KEY_LEN], sealed: &[u8], aad: &[u8]) -> Vec<u8> {
+    let (nonce, ciphertext) = sealed.split_at(NONCE_LEN);
+    XChaCha20Poly1305::new(Key::from_slice(key))
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .expect("the tag should match")
 }
 
 /// The protected password of each entry of a decrypted JSON content, as
@@ -667,7 +618,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 #[test]
 fn decrypted_json_holds_no_password() {
     let path = temp_vault("level-1");
-    let pepper = temp_pepper("level-1");
+    let (pepper, pepper_bytes) = temp_pepper_with_bytes("level-1");
     let key = VaultKey::new("master", &pepper).expect("key derivation should succeed");
     let passwords = ["correct-horse-battery", "Tr0ub4dor&3"];
     let mut vault = Vault::new();
@@ -680,7 +631,7 @@ fn decrypted_json_holds_no_password() {
     vault.save(&path, &key).expect("save should succeed");
 
     // What opening the vault decrypts: the payload, not the passwords.
-    let (_, json) = open_layers(&path, "master", &pepper);
+    let (_, json) = open_layers(&path, "master", &pepper_bytes);
     for password in passwords {
         assert!(!contains(&json, password.as_bytes()));
     }
@@ -732,13 +683,13 @@ fn vault_with_old_password(name: &str, pepper: &Pepper) -> (PathBuf, PathBuf) {
 
 #[test]
 fn password_change() {
-    let pepper = temp_pepper("passwd");
+    let (pepper, pepper_bytes) = temp_pepper_with_bytes("passwd");
     let (path, backup) = vault_with_old_password("passwd", &pepper);
 
     let (vault, key) = Vault::open(&path, "old password", &pepper).expect("open should succeed");
     let vault_id =
         fs::read(&path).expect("read should succeed")[VAULT_ID_OFFSET..HEADER_LEN].to_vec();
-    let (_, json_before) = open_layers(&path, "old password", &pepper);
+    let (_, json_before) = open_layers(&path, "old password", &pepper_bytes);
     let new_key = key
         .rewrap("new password", &pepper)
         .expect("rewrap should succeed");
@@ -772,7 +723,7 @@ fn password_change() {
 
     // Same data key, so same field key: the protected fields are kept byte for
     // byte, and still open (checked above).
-    let (_, json_after) = open_layers(&path, "new password", &pepper);
+    let (_, json_after) = open_layers(&path, "new password", &pepper_bytes);
     assert_eq!(
         protected_passwords(&json_after),
         protected_passwords(&json_before)
@@ -794,14 +745,14 @@ fn password_change() {
 
 #[test]
 fn password_change_with_key_rotation() {
-    let pepper = temp_pepper("passwd-rotate");
+    let (pepper, pepper_bytes) = temp_pepper_with_bytes("passwd-rotate");
     let (path, backup) = vault_with_old_password("passwd-rotate", &pepper);
 
     let (mut vault, key) =
         Vault::open(&path, "old password", &pepper).expect("open should succeed");
     let vault_id =
         fs::read(&path).expect("read should succeed")[VAULT_ID_OFFSET..HEADER_LEN].to_vec();
-    let (old_data_key, json_before) = open_layers(&path, "old password", &pepper);
+    let (old_data_key, json_before) = open_layers(&path, "old password", &pepper_bytes);
     let fields_before = protected_passwords(&json_before);
 
     // As `passwd --rotate-key` does.
@@ -831,7 +782,7 @@ fn password_change_with_key_rotation() {
         // encrypted again.
         let data = fs::read(file).expect("read should succeed");
         assert_eq!(&data[VAULT_ID_OFFSET..HEADER_LEN], vault_id);
-        let (new_data_key, json) = open_layers(file, "new password", &pepper);
+        let (new_data_key, json) = open_layers(file, "new password", &pepper_bytes);
         assert!(new_data_key != old_data_key);
         let fields = protected_passwords(&json);
         assert_eq!(fields.len(), fields_before.len());
@@ -840,6 +791,45 @@ fn password_change_with_key_rotation() {
 
     fs::remove_file(&path).expect("cleanup should succeed");
     fs::remove_file(&backup).expect("cleanup should succeed");
+}
+
+#[test]
+fn a_backup_that_cannot_be_replaced_is_reported_after_the_save() {
+    let path = temp_vault("backup-not-replaced");
+    let backup = path.with_extension("argos.bak");
+    let pepper = temp_pepper("backup-not-replaced");
+    let key = VaultKey::new("master", &pepper).expect("key derivation should succeed");
+    let _ = fs::remove_file(&path);
+    // A directory where the backup goes: no file can replace it.
+    let _ = fs::remove_dir(&backup);
+    fs::create_dir(&backup).expect("mkdir should succeed");
+
+    assert!(matches!(
+        Vault::new().save_and_replace_backup(&path, &key),
+        Err(Error::BackupNotReplaced { path: failed, .. }) if failed == backup
+    ));
+    // The error says so: the vault itself was saved.
+    assert!(Vault::open(&path, "master", &pepper).is_ok());
+
+    fs::remove_dir(&backup).expect("cleanup should succeed");
+    fs::remove_file(path.with_extension("argos.bak.tmp")).expect("cleanup should succeed");
+    fs::remove_file(&path).expect("cleanup should succeed");
+}
+
+#[test]
+fn a_locked_vault_cannot_be_locked_again() {
+    let path = temp_vault("lock");
+    let lock_file = path.with_extension("argos.lock");
+
+    let first = VaultLock::acquire(&path).expect("the vault should be free");
+    assert!(matches!(VaultLock::acquire(&path), Err(Error::VaultBusy)));
+    drop(first);
+    let again = VaultLock::acquire(&path).expect("the lock should be released");
+    drop(again);
+
+    // The lock file stays in place, empty.
+    assert_eq!(fs::metadata(&lock_file).expect("metadata").len(), 0);
+    fs::remove_file(&lock_file).expect("cleanup should succeed");
 }
 
 /// The recovery code of the pepper made of 32 bytes `0x42`. Its check group
@@ -960,47 +950,47 @@ fn importing_the_installed_pepper_writes_nothing() {
 
 #[test]
 fn vault_pepper_id_reads_only_the_header() {
-    // The current format: the id of the pepper, read without any password.
-    let v3_path = temp_vault("pepper-id-v3");
-    let pepper = temp_pepper("pepper-id-v3");
+    // The id of the pepper, read without any password.
+    let v4_path = temp_vault("pepper-id-v4");
+    let pepper = temp_pepper("pepper-id-v4");
     let key = VaultKey::new("master", &pepper).expect("key derivation should succeed");
     Vault::new()
-        .save(&v3_path, &key)
+        .save(&v4_path, &key)
         .expect("save should succeed");
     assert_eq!(
-        vault_pepper_id(&v3_path).expect("read should succeed"),
-        Some(pepper.id())
+        vault_pepper_id(&v4_path).expect("read should succeed"),
+        pepper.id()
     );
 
-    // Format v2 has no pepper. Nothing is decrypted: random bytes after the
-    // header are enough.
+    // An older format fails as when opening. Nothing is decrypted: random
+    // bytes after the header are enough.
     let v2_path = temp_vault("pepper-id-v2");
     let mut v2 = old_header(2, &[7u8; SALT_LEN]);
     v2.extend_from_slice(&[0xaa; ENVELOPE_LEN + 24 + 16]);
     fs::write(&v2_path, &v2).expect("write should succeed");
-    assert_eq!(
-        vault_pepper_id(&v2_path).expect("read should succeed"),
-        None
-    );
+    assert!(matches!(
+        vault_pepper_id(&v2_path),
+        Err(Error::UnsupportedVersion(2))
+    ));
 
     // The legacy layout has no header at all.
     let legacy_path = temp_vault("pepper-id-legacy");
     fs::write(&legacy_path, [0x55; 70]).expect("write should succeed");
-    assert_eq!(
-        vault_pepper_id(&legacy_path).expect("read should succeed"),
-        None
-    );
+    assert!(matches!(
+        vault_pepper_id(&legacy_path),
+        Err(Error::BadMagic)
+    ));
 
     // The header is validated as when opening.
-    let mut data = fs::read(&v3_path).expect("read should succeed");
+    let mut data = fs::read(&v4_path).expect("read should succeed");
     data[6..10].copy_from_slice(&u32::MAX.to_le_bytes()); // memory cost: 4 TiB
-    fs::write(&v3_path, &data).expect("write should succeed");
+    fs::write(&v4_path, &data).expect("write should succeed");
     assert!(matches!(
-        vault_pepper_id(&v3_path),
+        vault_pepper_id(&v4_path),
         Err(Error::UnsupportedKdfParams(_))
     ));
 
-    for path in [v3_path, v2_path, legacy_path] {
+    for path in [v4_path, v2_path, legacy_path] {
         fs::remove_file(&path).expect("cleanup should succeed");
     }
 }
@@ -1156,29 +1146,68 @@ fn cli_rejects_a_wrong_pepper_before_asking_for_the_password() {
 }
 
 #[test]
-fn newer_format_is_unsupported_even_without_a_pepper() {
-    let path = temp_vault("newer-format");
-    let pepper_path = temp_pepper_path("newer-format");
+fn other_formats_are_unsupported_even_without_a_pepper() {
+    let path = temp_vault("other-formats");
+    let pepper_path = temp_pepper_path("other-formats");
+    let salt = [7u8; SALT_LEN];
 
     // The fields of a v4 header (pepper id, vault id), with a version this
     // build does not know.
-    let mut v5 = old_header(5, &[7u8; SALT_LEN]);
+    let mut v5 = old_header(5, &salt);
     v5.extend_from_slice(&[9u8; PEPPER_ID_LEN]);
     v5.extend_from_slice(&[3u8; 16]);
     assert_eq!(v5.len(), HEADER_LEN);
-    fs::write(&path, &v5).expect("write should succeed");
+    let legacy = vec![0x55u8; 70];
 
-    assert!(matches!(
-        requires_existing_pepper(&path),
-        Err(Error::UnsupportedVersion(5))
-    ));
+    for data in [legacy, old_header(1, &salt), old_header(2, &salt), v5] {
+        fs::write(&path, &data).expect("write should succeed");
 
-    // Not reported as a missing pepper, and no pepper is created for it.
-    let output = run_cli(&path, &pepper_path, &["list"], b"");
-    assert_eq!(output.status.code(), Some(4));
-    assert!(!pepper_path.exists());
+        // Not reported as a missing pepper, with a hint, no pepper is created
+        // for it, and the vault is left as it is.
+        let output = run_cli(&path, &pepper_path, &["list"], b"");
+        assert_eq!(output.status.code(), Some(4));
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 output");
+        assert!(stderr.contains("Hint:"));
+        assert!(!pepper_path.exists());
+        assert_eq!(fs::read(&path).expect("read should succeed"), data);
+    }
 
     fs::remove_file(&path).expect("cleanup should succeed");
+}
+
+#[test]
+fn cli_refuses_a_pepper_path_used_by_the_vault() {
+    let path = temp_vault("cli-pepper-path");
+    let name = path.file_name().expect("a file name").to_owned();
+    // The same file as the backup, written another way.
+    let mut same_as_backup = std::env::temp_dir().join(".").join(name);
+    same_as_backup.as_mut_os_string().push(".bak");
+
+    for pepper_path in [
+        path.clone(),
+        path.with_extension("argos.tmp"),
+        path.with_extension("argos.bak"),
+        path.with_extension("argos.lock"),
+        same_as_backup,
+    ] {
+        // Refused before the master password is asked for: nothing is written.
+        let output = run_cli(&path, &pepper_path, &["init"], b"");
+        assert_eq!(output.status.code(), Some(1), "{}", pepper_path.display());
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 output");
+        assert!(stderr.contains("also used for the vault"));
+        assert!(!path.exists());
+        assert!(!pepper_path.exists());
+    }
+
+    // An existing pepper at such a path is refused too, and left untouched.
+    let pepper_path = path.with_extension("argos.bak");
+    Pepper::create(&pepper_path).expect("pepper creation should succeed");
+    let before = fs::read(&pepper_path).expect("read should succeed");
+    let output = run_cli(&path, &pepper_path, &["pepper", "status"], b"");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(fs::read(&pepper_path).expect("read should succeed") == before);
+
+    fs::remove_file(&pepper_path).expect("cleanup should succeed");
 }
 
 #[cfg(unix)]

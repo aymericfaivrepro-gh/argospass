@@ -15,21 +15,27 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Every action is pinned to a commit SHA, with its version in a comment: a tag
+# can be moved to other code, a commit cannot. Dependabot updates both.
+
 jobs:
   check:
     name: Format, lint and test
     runs-on: ubuntu-latest
     steps:
       - name: Check out the code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          # Given explicitly: pinned to a commit, the action cannot read the
+          # toolchain from its ref.
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache Cargo dependencies and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -40,15 +46,36 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
+  windows:
+    name: Lint on Windows
+    # The code must compile on Windows (every `std::os::unix` use is behind
+    # `#[cfg(unix)]`): Clippy builds every target there, tests included.
+    runs-on: windows-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Cache Cargo dependencies and build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Lint with Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
   audit:
     name: Security audit of dependencies
     runs-on: ubuntu-latest
     steps:
       - name: Check out the code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-audit
 

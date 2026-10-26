@@ -53,15 +53,19 @@ argospass --help                                      # full help (also: argospa
 | `list` | List all entries (no passwords shown) | Yes |
 | `get <TITLE>` | Copy the entry's password to the clipboard and clear it after 20 seconds. `--show` prints it instead. | Yes |
 | `remove <TITLE>` | Delete an entry | Yes |
-| `generate` | Print a random password: 24 characters by default (minimum 8), symbols included unless `--no-symbols` is given | No |
+| `generate` | Print a random password: 24 characters by default (from 8 to 1024), symbols included unless `--no-symbols` is given | No |
 | `passwd [--rotate-key]` | Change the master password. `--rotate-key` also generates a new data key, and encrypts every password again with it. Without `--rotate-key`, the new password must differ from the current one. See [Changing the master password](#changing-the-master-password). | Yes, then chooses the new one |
 | `pepper status` | Show the pepper file, its id, and whether it matches the vault. See [Pepper recovery code](#pepper-recovery-code). | No |
 | `pepper export` | Print the pepper as a recovery code, to write down or move to another computer | No |
 | `pepper import` | Rebuild the pepper file from its recovery code, read from stdin or typed with hidden input. Never overwrites an existing pepper file. | No |
 
-You get **3 attempts** to type the master password.
+You get **3 attempts** to type the master password. A new master password (`init`, `passwd`) must be at least **12 characters** long.
 
-The clipboard is only cleared if it still contains the password ArgosPass put there, so anything you copied in the meantime is not erased.
+The clipboard is only cleared if it still contains the password ArgosPass put there, so anything you copied in the meantime is not erased. If it cannot be read back, it is cleared all the same; if it cannot be cleared, ArgosPass says so.
+
+`list` and `get` show the control characters an entry may hold (line breaks, escape sequences…) as `�`, so that an entry cannot drive the terminal (change its title, write to the clipboard, hide text).
+
+`add`, `remove` and `passwd` hold a lock on the vault from reading it to saving it (and `init` while it writes it). A second command that tries to change the same vault at the same time stops with an error (exit code `1`) instead of overwriting the first one's changes. `list` and `get` need no lock: a save replaces the file in one go.
 
 ### Global options
 
@@ -76,6 +80,8 @@ The clipboard is only cleared if it still contains the password ArgosPass put th
 
 Logs go to **stderr**, so they never mix with a command's output. They only show public values. The master password, keys, decrypted content and entry passwords are never logged. Neither is the size of an encrypted password: it would give the length of the password.
 
+The error never tells a wrong master password from a damaged file, and neither do the main steps shown by `-v`. The details shown by `-vv` do: they show how far opening got (for example, that the envelope opened before the content failed), which helps to diagnose a problem.
+
 ### Vault and pepper locations
 
 | System | Default vault path | Default pepper path |
@@ -84,9 +90,11 @@ Logs go to **stderr**, so they never mix with a command's output. They only show
 | macOS | `~/Library/Application Support/argospass/vault.argos` | `~/Library/Application Support/argospass/pepper.key` |
 | Windows | `%APPDATA%\argospass\vault.argos` | `%LOCALAPPDATA%\argospass\pepper.key` |
 
-On Windows, the pepper is in the *local* application data, which roaming profiles do not sync, unlike the vault. On Linux and macOS, both default to the **same directory**. That is fine as long as this directory is not synced or backed up as a whole. Otherwise, keep the pepper somewhere else with `--pepper` or `ARGOSPASS_PEPPER`.
+On Windows, the pepper is in the *local* application data, which roaming profiles do not sync, unlike the vault. On Linux and macOS, both default to the **same directory**. That is fine only as long as this directory is not synced or backed up as a whole, and backup tools often do back it up by default: Time Machine (macOS) includes `~/Library/Application Support`, and Déjà Dup (many Linux desktops) the whole home directory. A backup that holds both files leaves only the master password to protect the vault. If such a backup is enabled, keep the pepper somewhere else with `--pepper` or `ARGOSPASS_PEPPER`, or exclude it from the backup and back it up separately.
 
-The previous version of the vault is kept next to it, under the vault's file name followed by `.bak` (`vault.argos.bak`). After `passwd`, the backup is replaced by the new version, so that no file encrypted under the old password is left next to the vault.
+The previous version of the vault is kept next to it, under the vault's file name followed by `.bak` (`vault.argos.bak`). After `passwd`, the backup is replaced by the new version, so that no file encrypted under the old password is left next to the vault. If the backup cannot be replaced, `passwd` says so, and that the new password is already in use: delete the backup yourself.
+
+The lock is an empty file next to the vault, under its file name followed by `.lock` (`vault.argos.lock`). It stays there between commands: delete it only when no ArgosPass command is running.
 
 Earlier versions of ArgosPass named the backup of a vault whose name does not end in `.argos` after the name without its extension (`secrets.argos.bak` for `secrets.db`). ArgosPass no longer writes or replaces that file: delete it yourself, it may still open with an old password.
 
@@ -94,9 +102,10 @@ Earlier versions of ArgosPass named the backup of a vault whose name does not en
 
 ### Pepper file
 
-The pepper is a file of 32 random bytes, kept **outside the vault**. ArgosPass needs it, in addition to the master password, to open any vault created since format v3. See [What the pepper adds](#what-the-pepper-adds) for what it protects against.
+The pepper is a file of 32 random bytes, kept **outside the vault**. ArgosPass needs it, in addition to the master password, to open a vault. See [What the pepper adds](#what-the-pepper-adds) for what it protects against.
 
-- `init` creates it if it does not exist yet, and otherwise reuses it: several vaults can share one pepper. Opening a vault in an older format also creates it if needed, then upgrades the vault to use it. ArgosPass then prints a large warning with its path.
+- `init` creates it if it does not exist yet, and otherwise reuses it: several vaults can share one pepper. When it creates one, ArgosPass prints a large warning with its path.
+- The pepper file can be neither the vault itself nor one of the files ArgosPass writes next to it (`.tmp`, `.bak`, `.bak.tmp`, `.lock`): saving the vault would overwrite it. Such a `--pepper` path is refused before anything is read or written, even when it names the same file another way (through `..`, `.` or a link).
 - **Without the pepper file, the vault cannot be opened, even with the right master password.** Nothing can rebuild it except your own backup. Back it up right after it is created, **separately from the vault** (for example on a USB key, in another password manager, or as a [recovery code](#pepper-recovery-code) written on paper), and never keep it next to the vault in a synced folder.
 - An existing pepper file is never overwritten. On Unix, it is created with `600` permissions (and a warning is shown if other users can access it).
 - If the pepper file is missing, damaged, or not the one the vault was created with, opening the vault stops before the master password is asked for (and before any key derivation) and exits with code `8`, with a hint. (`init` asks for the new master password first: a damaged pepper file is only reported after it.) Point it to the right file with `--pepper <PATH>`, or rebuild it from its recovery code with `pepper import`.
@@ -129,7 +138,7 @@ The code goes to stdout and the explanations to stderr. Run `clear` once you hav
 - If **another** pepper file is already there (or a file that is not a pepper), the import is refused with exit code `8`, and the file is left untouched: overwriting it could make the vaults created with it unreadable. If you really mean to replace it, move it elsewhere yourself first, and keep it until you are sure no vault needs it.
 - If the vault exists, the command then tells whether the pepper matches it. This check is only informative: if the vault cannot be read, a warning is shown, and the import still succeeds.
 
-`argospass pepper status` shows the path of the pepper file, whether it exists, its id (first 4 bytes), and, if the vault exists, whether the pepper matches it or the vault predates the pepper. It never shows the pepper, and does not decrypt the vault: it only reads the pepper id from the vault header.
+`argospass pepper status` shows the path of the pepper file, whether it exists, its id (first 4 bytes), and, if the vault exists, whether the pepper matches it. It never shows the pepper, and does not decrypt the vault: it only reads the pepper id from the vault header.
 
 The `pepper` commands do not ask for the master password. It would protect nothing: the pepper file is not encrypted, so anyone who can run ArgosPass under your account can read it anyway.
 
@@ -146,10 +155,10 @@ Never send the code or the pepper file through the cloud, e-mail or a chat, even
 | Code | Meaning |
 | --- | --- |
 | `0` | Success |
-| `1` | Other error |
+| `1` | Other error (for example, the vault is in use by another command) |
 | `2` | Invalid command-line usage |
 | `3` | Wrong master password, or corrupted vault |
-| `4` | Invalid or unsupported vault file |
+| `4` | Invalid or unsupported vault file: damaged header, format other than v4, or larger than 64 MiB |
 | `5` | Input/output error |
 | `6` | No entry with this title |
 | `7` | An entry with this title already exists |
@@ -165,9 +174,11 @@ Never send the code or the pepper file through the cloud, e-mail or a chat, even
 | **Theft of the vault file** (lost laptop, leaked cloud copy, backup) | Content is encrypted. Without the pepper file, guessing the master password is hopeless (see [What the pepper adds](#what-the-pepper-adds)). With it, each guess still costs a full Argon2id derivation: tens of megabytes of memory and a noticeable delay. |
 | **Modification of the vault file** | Every byte is authenticated: the envelope and the content by their Poly1305 tags, the header and the envelope as associated data. Any change makes opening fail. |
 | **Downgrade of the key derivation** (an attacker lowers the Argon2 parameters in the header to speed up guessing) | Parameters are authenticated, and values below a security floor are refused before any derivation. |
-| **Absurd parameters in a crafted file** (memory exhaustion) | Values above an upper limit are refused. |
-| **Crash or power loss during a save** | Atomic write: the old vault stays intact until the new one is fully on disk, and a `.bak` copy is kept. |
-| **Other users of the same machine** | On Unix, the vault is created with `600` permissions and its directory with `700`. |
+| **Downgrade to an older file format** (an attacker who knows the master password, but not the pepper, replaces the vault with one of their own in a format that did not use the pepper) | Only format v4 is opened: older formats are refused before any key derivation, and left as they are (see [Older formats](#older-formats-no-longer-opened)). |
+| **Absurd parameters in a crafted file** (memory exhaustion) | Values above an upper limit (1 GiB of memory, 16 passes) are refused, and so is a vault file larger than 64 MiB. |
+| **Crash or power loss during a save** | Atomic write: the old vault stays intact until the new one is fully on disk, directory entry included, and a `.bak` copy is kept, written the same way. |
+| **Two commands changing the vault at once** | A command that changes the vault holds its lock: the second one stops with an error instead of overwriting the first one's changes. |
+| **Other users of the same machine** | On Unix, the vault, its backup and the pepper are created with `600` permissions and new directories with `700`. A leftover temporary file is never reused: it could keep other permissions, or be a link to another file. |
 | **Shoulder surfing and shell history** | Passwords are never command-line arguments and are typed with hidden input. By default, `get` copies to the clipboard instead of printing. |
 | **Secrets lingering in memory** | Keys, decrypted content and passwords are overwritten when no longer needed (see [Secrets in memory](#secrets-in-memory)). The passwords stay encrypted in memory, and are decrypted one at a time (see [What the two levels of encryption add](#what-the-two-levels-of-encryption-add)). |
 
@@ -177,7 +188,8 @@ The pepper is a 256-bit random secret, stored in its own file and never in the v
 
 - **It protects against the theft or leak of the vault file alone** (cloud copy, backup, a USB key holding only the vault). To test a single password guess, an attacker would also need the 256 random bits of the pepper: guessing becomes hopeless, even for a weak master password.
 - **It does not help** if the attacker gets both files: from a synced folder or a backup holding both, or from the machine itself. Then only the master password and Argon2id protect the vault, as before the pepper.
-- **It does not protect copies made before the pepper existed** (format v2 and older: old backups, cloud history). They still open with the master password alone.
+- **It does not protect copies made before the pepper existed** (format v2 and older: old backups, cloud history). Whoever gets one can try passwords on it without the pepper, with their own tools, even though ArgosPass no longer opens it.
+- **It also guards the vault's authenticity**, since only format v4 is opened: someone who knows the master password, but not the pepper, cannot make ArgosPass accept a vault of their own in an older format, which needed no pepper.
 - **Losing it means losing the vault.** Back it up separately from the vault, for example as a [recovery code](#pepper-recovery-code) on paper (see [Pepper file](#pepper-file)).
 
 The vault header stores a pepper **id**: the first 16 bytes of SHA-256(`"ArgosPass pepper id v1"` ‖ pepper). It is public and reveals nothing usable about the pepper, but it lets ArgosPass tell a wrong pepper file from a wrong password, before any key derivation.
@@ -194,7 +206,7 @@ From format v4 on, each password is encrypted a second time, on its own, inside 
 ### What ArgosPass does not protect against
 
 - **A compromised machine.** Malware, a keylogger or an administrator can read the master password as you type it, the pepper file, or the decrypted vault while ArgosPass runs. No password manager can defend against that.
-- **A weak master password.** Argon2id slows down guessing but cannot save a short or common password. Use a long passphrase, for example 5 or more random words.
+- **A weak master password.** Argon2id slows down guessing but cannot save a short or common password. ArgosPass requires at least 12 characters, but cannot tell a common phrase from a random one. Use a long passphrase, for example 5 or more random words.
 - **A forgotten master password.** There is no recovery mechanism or back door. A lost password means a lost vault.
 - **Rollback.** An attacker who can write the file can replace it with an **older, valid** version of your vault, and ArgosPass will not notice yet.
 - **Metadata.** The file size reveals the approximate size of the content, so roughly how many entries you have. The modification date shows when you last changed it.
@@ -262,7 +274,7 @@ payload ─────────────────► XChaCha20-Poly130
                   JSON entries (passwords still encrypted)
 ```
 
-1. ArgosPass reads the header and checks the magic bytes, the format version, the Argon2 parameters and the file length, all before any key derivation.
+1. ArgosPass checks the file size (at most 64 MiB), reads the header and checks the magic bytes, the format version (only version 4 is opened), the Argon2 parameters and the file length, all before any key derivation.
 2. It also checks that the pepper id in the header is the id of the pepper file, still before any derivation. Otherwise it stops: wrong or missing pepper (exit code `8`). The command line already does this check from the header alone before asking for the master password; it is done again here because the id is only authenticated by the envelope's tag, and the file may have changed in between.
 3. The master password, the pepper and the salt go through Argon2id with the parameters from the header. The output is the KEK.
 4. The KEK opens the envelope: XChaCha20-Poly1305 checks the envelope's tag over the encrypted data key **and the header**, then decrypts the data key. The KEK is wiped right away.
@@ -281,7 +293,7 @@ Saving needs neither the master password nor Argon2id: the keys are kept in memo
 
 ### Changing the master password
 
-1. `passwd` unlocks the vault with the current password, then asks for the new one twice.
+1. `passwd` takes the vault's lock, unlocks the vault with the current password, then asks for the new one twice (at least 12 characters).
 2. Without `--rotate-key`, a new password identical to the current one is refused: keeping both the password and the data key would bring no security. The current password is not kept in memory for this: ArgosPass tries the new password on the current envelope, which costs one more Argon2id run. With `--rotate-key`, the same password is accepted.
 3. A new KEK is derived from the new password, with a **new salt**, the current default Argon2 parameters and the same pepper: `passwd` never changes the pepper, nor the vault id.
 4. The same data key is wrapped with the new KEK. Its subkeys do not change, so the encrypted passwords are kept as they are. With `--rotate-key`, a new random data key is generated instead, which gives a new payload key and a new field key: **every password is decrypted with the old field key and encrypted again with the new one**, before anything is written. If one of them fails to open, nothing is written.
@@ -305,9 +317,9 @@ Saving needs neither the master password nor Argon2id: the keys are kept in memo
 | --- | --- | --- | --- |
 | New vaults | 128 MiB | 3 | 4 |
 | Minimum accepted | 64 MiB | 3 | 1 |
-| Maximum accepted | 4 GiB | 64 | 64 |
+| Maximum accepted | 1 GiB | 16 | 64 |
 
-Parameters are stored in each vault's header, so the defaults can be raised later without breaking existing vaults.
+Parameters are stored in each vault's header, so the defaults can be raised later without breaking existing vaults. The maximum bounds what a crafted header can make ArgosPass spend before any tag is checked: about 40 times the cost of the defaults. The parallelism only splits the same memory into lanes, so it does not add to that cost.
 
 ### Password generator
 
@@ -329,7 +341,7 @@ Each character is chosen with **rejection sampling**: random bytes that would ma
 
 ## Vault file format
 
-### Version 4 (current)
+### Version 4
 
 | Offset | Size | Part | Field |
 | --- | --- | --- | --- |
@@ -352,16 +364,20 @@ The header (66 bytes) and the envelope (72 bytes) are stored **in clear**, since
 
 The salt, the nonces, the pepper id and the vault id are not secret. The salt and the nonces must be unique: the salt makes each vault's KEK different even with the same password and pepper (and rules out precomputed tables), and the nonces make each encryption different. The vault id is kept by `passwd`, with or without `--rotate-key`: every encrypted password is bound to it. The pepper itself is never in the file.
 
-### Older formats (upgraded automatically)
+### Older formats (no longer opened)
 
-Vaults in an older format are still opened (without the pepper before version 3), then **automatically re-saved in version 4**: with a new salt, the current Argon2 parameters, the pepper (created if there is none yet), a **new random data key** and a new vault id. Each entry gets an id, and its password is encrypted on its own with the field key. The old key is never reused: a key that protected a weaker format (without the pepper, or with every password in clear in the decrypted content) could otherwise still open the new vault. The `.bak` backup is replaced by the new version too, so that no copy in the old format is left next to the vault. A warning is shown, only after the vault was decrypted successfully. Copies kept elsewhere stay in their old format: those older than version 3 still open without the pepper.
+ArgosPass only opens format v4. A vault in an older format is refused with exit code `4` and a hint, before any key derivation, and left as it is: nothing is written, and no pepper file is created for it. A legacy vault, which has no header, is reported as `not an ArgosPass vault`.
 
-| Version | Layout | Empty vault |
-| --- | --- | --- |
-| 3 | Header of 50 bytes (no vault id), then the same envelope and payload as version 4, but the data key itself encrypts the JSON, and the passwords are in clear inside it. | 176 bytes |
-| 2 | Header of 34 bytes (no pepper id), then the same envelope and payload as version 3. The KEK is derived without a pepper. | 160 bytes |
-| 1 | Same 34-byte header (with version `1`), followed directly by `nonce (24) ‖ encrypted JSON ‖ tag (16)`: the entries are encrypted with the key derived from the master password, with the header as associated data. | 88 bytes |
-| 0 (legacy) | `salt (16) ‖ nonce (24) ‖ ciphertext ‖ tag (16)`, with no header (no magic bytes) and no associated data, opened with the default parameters of the time. | 70 bytes |
+| Version | Layout |
+| --- | --- |
+| 3 | Header of 50 bytes (no vault id), then the same envelope and payload as version 4, but the data key itself encrypts the JSON, and the passwords are in clear inside it. |
+| 2 | Header of 34 bytes (no pepper id), then the same envelope and payload as version 3. The KEK is derived without a pepper. |
+| 1 | Same 34-byte header (with version `1`), followed directly by `nonce (24) ‖ encrypted JSON ‖ tag (16)`: the entries are encrypted with the key derived from the master password, with the header as associated data. |
+| 0 (legacy) | `salt (16) ‖ nonce (24) ‖ ciphertext ‖ tag (16)`, with no header (no magic bytes) and no associated data. |
+
+Earlier builds opened these formats, then rewrote them in version 4 automatically. That made them a way around the pepper: someone who knows the master password, but not the pepper, and can write the vault file (a synced folder), could replace the vault with a version 1 vault holding entries of their choice. ArgosPass accepted it, and re-encrypted it under the pepper. The silent rewrite also told them whether a password they guessed was the right one.
+
+To convert an old vault that you know is yours, open it once with a build of ArgosPass up to commit `a485011` (for example `git checkout a485011`, then `cargo run -- --vault <PATH> --pepper <PATH> list`). It rewrites the vault in version 4, with a new data key and the pepper (created if needed), and replaces its backup. Copies of the old file kept elsewhere stay in their old format: those older than version 3 are not protected by the pepper.
 
 ### Decrypted content
 
@@ -390,13 +406,14 @@ This JSON only ever exists in memory. It is never written to disk.
 ### Atomic writes
 
 ```
-vault.argos.tmp  ← 1. write the new content (permissions 600), then fsync to force it onto the disk
-vault.argos.bak  ← 2. copy of the current vault
-vault.argos      ← 3. atomic rename of .tmp over the vault
-vault.argos.bak  ← 4. passwd and format upgrades only: replaced by a copy of the new vault
+vault.argos.bak.tmp ← 1. copy of the current vault (permissions 600), then fsync to force it onto the disk
+vault.argos.bak     ← 2. atomic rename of .bak.tmp over the backup
+vault.argos.tmp     ← 3. write the new content (permissions 600), then fsync
+vault.argos         ← 4. atomic rename of .tmp over the vault, then fsync of the directory
+vault.argos.bak     ← 5. passwd only: replaced the same way by a copy of the new vault
 ```
 
-The rename is atomic: at any moment, `vault.argos` is either the complete old version or the complete new one, never a half-written file.
+The rename is atomic: at any moment, `vault.argos` is either the complete old version or the complete new one, never a half-written file, and so is its backup. Flushing the directory makes the rename itself survive a crash. Each temporary file is created new: one left behind by an interrupted save is deleted first, never reused, since it could keep other permissions, or be a link to another file.
 
 ## Secrets in memory
 
@@ -409,13 +426,12 @@ When freed, memory is not erased: secrets could remain in RAM, then end up in a 
 | Payload key and field key | `Box<Zeroizing<[u8; 32]>>`: HKDF writes them directly into a zeroed heap buffer. Kept while the command runs (saving and `get` need them) and wiped on drop |
 | Pepper | `Box<Zeroizing<[u8; 32]>>`: drawn at random, read from its file, or decoded from its recovery code, directly into a zeroed heap buffer. Kept while the command runs (opening and `passwd` need it) and wiped on drop |
 | Recovery code | `pepper export` builds it in a `Zeroizing<String>` of exactly its size. `pepper import` reads it into a pre-sized `Zeroizing<Vec<u8>>` (stdin) or `Zeroizing<String>` (typed, but see [Known limitations](#known-limitations)), then decodes it character by character straight into the pepper's buffer, with no copy of its own |
-| Keys of the old formats (v3, v2, v1, legacy) | Wiped right after decrypting the old file, before the upgrade. They never become a `VaultKey`, so nothing new can be encrypted with them |
 | Key copy inside the cipher | Each XChaCha20-Poly1305 instance keeps its own copy of the key. It only lives for one encryption or decryption, and the `chacha20poly1305` crate wipes it on drop |
 | Argon2 working memory (128 MiB by default) | Allocated by ArgosPass in a `Zeroizing` buffer and wiped after the derivation. The `argon2` crate would otherwise free it without wiping it. |
 | Decrypted JSON | `Zeroizing<Vec<u8>>`. From format v4 on, it holds no password: they stay encrypted inside it |
 | JSON before encryption | Exact size computed first, so the buffer never reallocates and leaves no unwiped copies behind |
 | Entries | `Entry` implements `ZeroizeOnDrop`: every field is wiped when the entry is dropped. Its password stays encrypted (`ProtectedField`) |
-| Entry passwords in clear | Only `get` decrypts one, for the entry asked for, into a `Zeroizing<String>` that reuses the decryption buffer (no copy). It is wiped right after the copy to the clipboard or the display. `add` encrypts the typed or generated password right away. `passwd --rotate-key` decrypts each password only for the time of encrypting it again. While an old vault is upgraded, its passwords are in clear in its old entries (`ZeroizeOnDrop` too) until the upgrade ends |
+| Entry passwords in clear | Only `get` decrypts one, for the entry asked for, into a `Zeroizing<String>` that reuses the decryption buffer (no copy). It is wiped right after the copy to the clipboard or the display. `add` encrypts the typed or generated password right away. `passwd --rotate-key` decrypts each password only for the time of encrypting it again. `get --show` prints it straight from that buffer, one character at a time, with no copy of its own |
 | Master passwords (current and new), generated passwords, clipboard read-back | `Zeroizing<String>`. The current password is wiped as soon as the vault is unlocked, even by `passwd` |
 
 ## Known limitations
@@ -425,10 +441,11 @@ When freed, memory is not erased: secrets could remain in RAM, then end up in a 
 - **Typed secrets:** `rpassword`, which reads hidden input, grows its buffer one character at a time, and each reallocation leaves the previous, unwiped copy in freed memory. A master password, or a recovery code typed or pasted on the terminal, may therefore leave partial copies behind. A recovery code read from stdin does not.
 - **Standard input and output buffers:** the Rust standard library keeps what goes through stdin and stdout in buffers that ArgosPass cannot wipe. A recovery code read from stdin, and a password or recovery code printed by `generate`, `get --show` or `pepper export`, stay there until the command exits.
 - **Ctrl+C during `get`:** interrupting the 20-second countdown leaves the password in the clipboard.
-- **Content decrypted at once:** the titles, usernames and URLs of every entry are in clear in memory while a command runs. The passwords are not (see [What the two levels of encryption add](#what-the-two-levels-of-encryption-add)), except the one `get` shows, each one in turn during `passwd --rotate-key`, and all of them while an old vault is upgraded.
+- **Content decrypted at once:** the titles, usernames and URLs of every entry are in clear in memory while a command runs. The passwords are not (see [What the two levels of encryption add](#what-the-two-levels-of-encryption-add)), except the one `get` shows, and each one in turn during `passwd --rotate-key`.
 - **No rollback protection** and **file size not hidden** (see [Security model](#security-model)).
-- **Upgrading an old vault:** the old content holds the passwords in clear. While it is read, `serde_json` unescapes a string that contains an escaped character (`\"`, `\\`, `\uXXXX`…) into an internal buffer that is not wiped: such a password may stay in freed memory.
-- **Old copies keep the old password:** copies of the vault made before a password change (cloud history, backups, other computers) still open with the old password, and copies made before the pepper (format v2 and older) open without it.
+- **Old copies keep the old password:** copies of the vault made before a password change (cloud history, backups, other computers) still open with the old password, and copies made before the pepper (format v2 and older) are not protected by it.
+- **File systems without locks:** on some network drives, the vault cannot be locked. ArgosPass then shows a warning and goes on without the lock: two commands that change the vault at the same time could lose changes.
+- **A vault appearing during `init`:** `init` checks again that there is no vault right before writing it, but a file that appears in that instant (from a sync tool) is replaced by the new vault. It is kept as the `.bak` backup, until the next save.
 - **Hash states are not wiped:** the `sha2`, `blake2`, `hmac` and `hkdf` crates do not wipe their internal state. Computing the pepper id (SHA-256), Argon2id's first step (Blake2b over the password and the pepper), and deriving the subkeys (HMAC-SHA256 over the data key itself, then keyed with a value derived from it and as secret as it) may leave short-lived copies of these secrets on the stack.
 
 ## Development
@@ -441,14 +458,14 @@ cargo clippy --all-targets --locked -- -D warnings  # lint (warnings are errors)
 cargo audit                                         # check dependencies against RustSec (cargo install cargo-audit)
 ```
 
-The CI (`.github/workflows/ci.yml`) runs the same checks on every push.
+The CI (`.github/workflows/ci.yml`) runs the same checks on every push, and Clippy on Windows too, so that the code is known to compile there. Its actions are pinned to a commit, which Dependabot keeps up to date.
 
 ### Project layout
 
 ```
 src/
 ├── main.rs        command-line interface (clap), prompts, clipboard, exit codes
-├── lib.rs         Entry, EntryId, ProtectedField, Vault, open/save, format upgrades, atomic writes
+├── lib.rs         Entry, EntryId, ProtectedField, Vault, open/save, vault lock, atomic writes
 ├── crypto.rs      Argon2id derivation, envelope encryption (KEK, data key), HKDF subkeys (payload key, field key), XChaCha20-Poly1305, KdfParams, VaultKey
 ├── format.rs      vault header: serialization, parsing, validation, format versions
 ├── hex.rs         hexadecimal encoding and decoding, written by hand
@@ -466,22 +483,26 @@ Unit tests live next to the code they test. Integration tests in `tests/vault.rs
 - a vault can be saved and reopened;
 - a wrong password is rejected;
 - no secret appears in clear in the file;
-- the backup is kept and no temporary file is left behind;
-- the file has `600` permissions (Unix only);
+- the backup is kept and no temporary file is left behind, neither the vault's nor the backup's;
+- the file has `600` permissions, even over a leftover temporary file readable by everyone, and a leftover temporary file that is a link is replaced, never written through (Unix only);
 - new vaults use format v4 (192 bytes when empty), with the pepper id at offset 34 and a random vault id at offset 50;
-- the decrypted JSON content (level 1) holds no password: the test decrypts it on its own, from the documented format (Argon2id, envelope, HKDF with the label written out), and finds each password as a protected field in hex, of the expected size;
+- the decrypted JSON content (level 1) holds no password: the test decrypts it on its own, with the primitives directly (`argon2`, `chacha20poly1305`, `hkdf`) and the documented format, and finds each password as a protected field in hex, of the expected size;
 - a wrong pepper is rejected before any key derivation, and a wrong password with the right pepper as before;
 - through the binary, a wrong pepper is rejected (exit code `8`) before the master password is asked for, by `list` and `passwd`;
 - a modified header, pepper id, vault id or envelope is rejected;
-- v3, v2, v1 and legacy vaults are upgraded to v4, their backup included, with a new data key, and then only open with the pepper; the passwords of the old vaults built by hand can still be read, and none is left in clear in the decrypted content; a wrong password leaves an old file byte for byte unchanged; two entries with the same title (possible in a file edited by hand) are both kept;
+- vaults in an older format (v3, v2, v1, legacy) are refused and left byte for byte unchanged, with no backup written; among them, a v1 vault forged with the right master password but without the pepper;
+- a vault file larger than 64 MiB is refused before being read;
 - after a password change (with or without `--rotate-key`), the vault and its backup open with the new password only, the vault id is kept, and the backup keeps `600` permissions; a plain `passwd` keeps every encrypted password byte for byte, and `--rotate-key` encrypts every one of them again, under a new data key;
+- a backup that cannot be replaced after a save is reported as such, the vault itself being saved;
+- a locked vault cannot be locked again until the lock is released;
 - a lost pepper file is rebuilt from its recovery code, and the vault opens again;
 - importing a pepper never overwrites another pepper file (left byte for byte identical), and importing the installed pepper writes nothing;
-- the pepper id of a vault is read from its header alone, and is absent before format v3;
-- a vault in a newer format is reported as unsupported (exit code `4`), not as missing its pepper, and no pepper file is created for it;
+- the pepper id of a vault is read from its header alone; for an older format, it fails as opening does;
+- through the binary, a vault in an older or newer format is reported as unsupported (exit code `4`), with a hint, not as missing its pepper, and no pepper file is created for it;
+- through the binary, a pepper path that is the vault or one of the files written next to it, even written another way, is refused before anything is written (exit code `1`);
 - through the binary: `pepper status`, `pepper export` (the code on stdout only, never on stderr, with a warning if the file it goes to is accessible to other users), and `pepper import` from stdin, which rejects a code with a typo (exit code `9`) and never replaces another pepper (exit code `8`).
 
-The unit tests of `crypto.rs` check the two levels of encryption: the subkeys against values computed independently (Python's `hmac`, following RFC 5869), that the payload key, the field key and the data key all differ, that no label is a prefix of another, that a password only opens for its own vault, entry and field name, the exact layout of its associated data, the 255-byte limit on field names, and that the payload is not encrypted with the data key itself. Those of `lib.rs` check that re-encrypting the passwords for `--rotate-key` is all or nothing, and that malformed ids and protected fields are rejected.
+The unit tests of `crypto.rs` check the two levels of encryption: the subkeys against values computed independently (Python's `hmac`, following RFC 5869), that the payload key, the field key and the data key all differ, that no label is a prefix of another, that a password only opens for its own vault, entry and field name, the exact layout of its associated data, the 255-byte limit on field names, and that the payload is not encrypted with the data key itself. They also check the bounds of the Argon2 parameters, and that `rewrap` refuses another pepper. Those of `format.rs` check that every format version but 4 is refused, as such even when shorter than a v4 header. Those of `lib.rs` check that re-encrypting the passwords for `--rotate-key` is all or nothing, that malformed ids and protected fields are rejected, the files written next to a vault, and the 64 MiB limit. Those of `error.rs` check that a JSON error shows nothing of the content, not even in its debug form. Those of `main.rs` check the 12-character minimum of a master password, and that control characters are never printed.
 
 The unit tests of `pepper.rs` also check the recovery code: its exact layout, that letter case, spaces and line breaks are tolerated, that a wrong prefix, a wrong length, a character that is not a hex digit, and every single-digit typo or swap of two neighbouring digits (for a fixed pepper) are rejected, and that a code typed over several lines is complete only with its last line.
 

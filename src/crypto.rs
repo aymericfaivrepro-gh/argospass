@@ -1,7 +1,7 @@
 //! Cryptography: deriving a key from the master password, envelope encryption
 //! and the two levels of authenticated encryption of the vault content.
 
-use crate::format::{Header, VAULT_ID_LEN};
+use crate::format::{HEADER_LEN, Header, VAULT_ID_LEN};
 use crate::pepper::Pepper;
 use crate::{EntryId, Error, ProtectedField, Result, to_hex};
 use argon2::{Algorithm, Argon2, Block, Params, Version};
@@ -59,14 +59,6 @@ impl KdfParams {
         parallelism: 4,
     };
 
-    /// Parameters hard-coded in vaults written before format v1.
-    /// Must never change, even if `DEFAULT` does.
-    pub const LEGACY: Self = Self {
-        memory_kib: 64 * 1024,
-        iterations: 3,
-        parallelism: 4,
-    };
-
     /// Weakest parameters accepted when opening a vault.
     pub const MINIMUM: Self = Self {
         memory_kib: 64 * 1024,
@@ -76,9 +68,12 @@ impl KdfParams {
 
     /// Strongest parameters accepted when opening a vault: a crafted header
     /// must not be able to exhaust memory or CPU before the tag is checked.
+    /// At most 1 GiB and 16 passes: about 40 times the cost of the defaults.
+    /// The parallelism only splits the same memory into lanes: it does not
+    /// add to the cost.
     pub const MAXIMUM: Self = Self {
-        memory_kib: 4 * 1024 * 1024,
-        iterations: 64,
+        memory_kib: 1024 * 1024,
+        iterations: 16,
         parallelism: 64,
     };
 
@@ -101,16 +96,16 @@ impl KdfParams {
 /// never the key bytes themselves, and wiped on drop.
 type SecretKey = Box<Zeroizing<[u8; KEY_LEN]>>;
 
-/// Key-encryption key (KEK): derived from the master password (and, from
-/// format v3 on, the pepper) with Argon2id.
+/// Key-encryption key (KEK): derived from the master password and the pepper
+/// with Argon2id.
 ///
 /// Only used to wrap and unwrap the [`DataKey`], never to encrypt the entries.
 struct Kek(SecretKey);
 
 impl Kek {
     /// Derives the KEK from the master password, the salt and parameters of
-    /// `header`, and the pepper if any.
-    fn derive(password: &str, header: &Header, pepper: Option<&Pepper>) -> Result<Self> {
+    /// `header`, and the pepper.
+    fn derive(password: &str, header: &Header, pepper: &Pepper) -> Result<Self> {
         derive_key(password, &header.salt, &header.params, pepper).map(Self)
     }
 
@@ -142,8 +137,8 @@ impl Kek {
 /// Data key: random, generated when the vault is created (and again by
 /// `passwd --rotate-key`), and stored in the file wrapped by the [`Kek`].
 ///
-/// From format v4 on, it encrypts nothing itself: the [`PayloadKey`] and the
-/// [`FieldKey`] are derived from it.
+/// It encrypts nothing itself: the [`PayloadKey`] and the [`FieldKey`] are
+/// derived from it.
 pub(crate) struct DataKey(SecretKey);
 
 impl DataKey {
@@ -212,11 +207,20 @@ impl VaultKey {
         )
     }
 
-    /// Wraps the same data key under a new password, with a fresh salt, the
-    /// current default Argon2 parameters and `pepper`. The data key, its
-    /// subkeys and the vault id do not change: the protected fields stay
-    /// valid as they are.
+    /// Wraps the same data key under a new password, with a fresh salt and
+    /// the current default Argon2 parameters. The data key, its subkeys and
+    /// the vault id do not change: the protected fields stay valid as they are.
+    ///
+    /// Fails with [`Error::PepperMismatch`] if `pepper` is not the vault's: a
+    /// new pepper needs a new data key (see [`Vault::rotate_key`](crate::Vault::rotate_key)),
+    /// never the same one wrapped again.
     pub fn rewrap(self, new_password: &str, pepper: &Pepper) -> Result<Self> {
+        let expected = self.header.pepper_id();
+        let found = pepper.id();
+        if found != expected {
+            return Err(Error::PepperMismatch { expected, found });
+        }
+
         info!("wrapping the data key under the new password");
         // Moves the box: the data key bytes are not copied.
         Self::seal(
@@ -251,63 +255,66 @@ impl VaultKey {
     /// Lets the caller compare a new password with the current one without
     /// keeping the current one in memory.
     pub fn opens_with(&self, password: &str, pepper: &Pepper) -> Result<bool> {
-        match Self::unlock(password, self.header, &self.envelope, Some(pepper)) {
+        match Self::unlock(password, self.header, &self.envelope, pepper) {
             Ok(_) => Ok(true), // this second copy of the keys is wiped here
             Err(Error::DecryptionFailed) => Ok(false),
             Err(error) => Err(error),
         }
     }
 
-    /// Opens the envelope of a vault in the current format with the master
-    /// password and `pepper`.
+    /// Opens the envelope of a vault with the master password and `pepper`.
     ///
-    /// Fails with [`Error::UnsupportedVersion`] for an older header (see
-    /// [`open_old_payload`]), with [`Error::PepperRequired`] or
-    /// [`Error::PepperMismatch`] if the pepper is missing or is not the
-    /// vault's, and with [`Error::DecryptionFailed`] if the password is wrong
-    /// or if the header or the envelope has been modified.
+    /// Fails with [`Error::PepperMismatch`] if `pepper` is not the vault's,
+    /// before any key derivation, and with [`Error::DecryptionFailed`] if the
+    /// password is wrong or if the header or the envelope has been modified.
     pub(crate) fn unlock(
         password: &str,
         header: Header,
         envelope: &[u8],
-        pepper: Option<&Pepper>,
+        pepper: &Pepper,
     ) -> Result<Self> {
-        // Checked before running Argon2id: a malformed file must fail fast.
-        let vault_id = vault_id_of(&header)?;
+        // Checked before running Argon2id: a malformed file must fail fast,
+        // and the pepper id is public, so a wrong pepper can be reported
+        // without a derivation.
         let envelope: [u8; ENVELOPE_LEN] = envelope.try_into().map_err(|_| Error::Truncated)?;
+        let expected = header.pepper_id();
+        let found = pepper.id();
+        if found != expected {
+            return Err(Error::PepperMismatch { expected, found });
+        }
 
-        let data_key = unwrap_data_key(password, &header, &envelope, pepper)?;
-        Self::from_parts(header, vault_id, envelope, data_key)
+        let data_key = {
+            let kek = Kek::derive(password, &header, pepper)?;
+            kek.unwrap_key(&envelope, &header.to_bytes())?
+        }; // the KEK is wiped here
+        // At -vv only: the main steps (-v) must not tell a wrong password
+        // (this step fails) from a damaged payload (a later step fails).
+        debug!("envelope opened");
+        Self::from_parts(header, envelope, data_key)
     }
 
     /// Wraps `data_key` with the KEK derived from `password`, `header` and
     /// `pepper`, whose id the header must carry.
     fn seal(password: &str, header: Header, data_key: DataKey, pepper: &Pepper) -> Result<Self> {
-        debug_assert_eq!(header.pepper_id(), Some(pepper.id()));
-        let vault_id = vault_id_of(&header)?;
+        debug_assert_eq!(header.pepper_id(), pepper.id());
         let envelope = {
-            let kek = Kek::derive(password, &header, Some(pepper))?;
+            let kek = Kek::derive(password, &header, pepper)?;
             kek.wrap_key(&data_key, &header.to_bytes())?
         }; // the KEK is wiped here
 
-        Self::from_parts(header, vault_id, envelope, data_key)
+        Self::from_parts(header, envelope, data_key)
     }
 
     /// Assembles the key material of a vault, and derives the two subkeys
     /// from the data key.
-    fn from_parts(
-        header: Header,
-        vault_id: [u8; VAULT_ID_LEN],
-        envelope: [u8; ENVELOPE_LEN],
-        data_key: DataKey,
-    ) -> Result<Self> {
+    fn from_parts(header: Header, envelope: [u8; ENVELOPE_LEN], data_key: DataKey) -> Result<Self> {
         let payload_key = PayloadKey(data_key.derive_subkey(PAYLOAD_KEY_LABEL)?);
         let field_key = FieldKey(data_key.derive_subkey(FIELD_KEY_LABEL)?);
         debug!("derived the payload key and the field key from the data key (HKDF-SHA256)");
 
         Ok(Self {
             header,
-            vault_id,
+            vault_id: header.vault_id(),
             envelope,
             data_key,
             payload_key,
@@ -317,7 +324,7 @@ impl VaultKey {
 
     /// Everything written before the payload: `header || envelope`.
     pub(crate) fn prefix(&self) -> Vec<u8> {
-        let mut prefix = Vec::with_capacity(self.header.encoded_len() + ENVELOPE_LEN);
+        let mut prefix = Vec::with_capacity(HEADER_LEN + ENVELOPE_LEN);
         prefix.extend_from_slice(&self.header.to_bytes());
         prefix.extend_from_slice(&self.envelope);
         prefix
@@ -415,69 +422,6 @@ mod aad {
     }
 }
 
-/// Returns the vault id of `header`, or fails with
-/// [`Error::UnsupportedVersion`] if its format has none (before v4).
-fn vault_id_of(header: &Header) -> Result<[u8; VAULT_ID_LEN]> {
-    header
-        .vault_id()
-        .ok_or(Error::UnsupportedVersion(header.version()))
-}
-
-/// Unwraps the data key from the envelope of a vault in format v2 or later.
-///
-/// `pepper` is only used if the header has a pepper id (format v3 and
-/// later): it must then be the pepper with that id. Both are checked before
-/// Argon2id runs.
-fn unwrap_data_key(
-    password: &str,
-    header: &Header,
-    envelope: &[u8; ENVELOPE_LEN],
-    pepper: Option<&Pepper>,
-) -> Result<DataKey> {
-    // Checked before running Argon2id: the pepper id is public, so a missing
-    // or wrong pepper can be reported without a derivation.
-    let pepper = match header.pepper_id() {
-        None => None, // before format v3: derived without a pepper
-        Some(expected) => {
-            let pepper = pepper.ok_or(Error::PepperRequired)?;
-            let found = pepper.id();
-            if found != expected {
-                return Err(Error::PepperMismatch { expected, found });
-            }
-            Some(pepper)
-        }
-    };
-
-    let data_key = {
-        let kek = Kek::derive(password, header, pepper)?;
-        kek.unwrap_key(envelope, &header.to_bytes())?
-    }; // the KEK is wiped here
-    info!("envelope opened");
-    Ok(data_key)
-}
-
-/// Decrypts the payload of a vault in format v2 or v3, where the data key
-/// itself encrypted the JSON content, with `header || envelope` as associated
-/// data.
-///
-/// Only for upgrading such a vault: the old data key is wiped before this
-/// returns, and never becomes a [`VaultKey`], so nothing can be encrypted
-/// with it any more. Fails as [`VaultKey::unlock`] does.
-pub(crate) fn open_old_payload(
-    password: &str,
-    header: &Header,
-    envelope: &[u8],
-    payload: &[u8],
-    pepper: Option<&Pepper>,
-) -> Result<Zeroizing<Vec<u8>>> {
-    let envelope: [u8; ENVELOPE_LEN] = envelope.try_into().map_err(|_| Error::Truncated)?;
-    let data_key = unwrap_data_key(password, header, &envelope, pepper)?;
-
-    let mut aad = header.to_bytes();
-    aad.extend_from_slice(&envelope);
-    decrypt(&data_key.0, payload, &aad)
-}
-
 /// Header for a new KEK: fresh random salt, the default Argon2id parameters,
 /// the id of `pepper` and `vault_id`.
 fn fresh_header(pepper: &Pepper, vault_id: [u8; VAULT_ID_LEN]) -> Result<Header> {
@@ -498,7 +442,7 @@ fn generate_vault_id() -> Result<[u8; VAULT_ID_LEN]> {
 }
 
 /// Generates a random salt using the operating system's CSPRNG.
-pub fn generate_salt() -> Result<[u8; SALT_LEN]> {
+fn generate_salt() -> Result<[u8; SALT_LEN]> {
     let mut salt = [0u8; SALT_LEN];
     getrandom::fill(&mut salt)?;
     debug!("generated random salt: {}", to_hex(&salt));
@@ -512,7 +456,7 @@ pub fn generate_salt() -> Result<[u8; SALT_LEN]> {
 ///
 /// Logs the nonce, the sizes and the tag at `-vv`: for an envelope or a
 /// payload, whose size is visible in the file anyway.
-pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     let output = encrypt_quietly(key, plaintext, aad)?;
     let (nonce, ciphertext) = output.split_at(NONCE_LEN);
     debug!("generated random nonce: {}", to_hex(nonce));
@@ -531,7 +475,7 @@ pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<
 /// (or the associated data) has been modified.
 ///
 /// Logs the nonce, the size and the tag at `-vv`, like [`encrypt`].
-pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+fn decrypt(key: &[u8; KEY_LEN], data: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if data.len() < NONCE_LEN + TAG_LEN {
         return Err(Error::Truncated);
     }
@@ -589,26 +533,19 @@ fn decrypt_quietly(key: &[u8; KEY_LEN], data: &[u8], aad: &[u8]) -> Result<Zeroi
         .map_err(|_| Error::DecryptionFailed)
 }
 
-/// Derives a 256-bit key from the master password and salt.
-///
-/// With `Some(pepper)`, the pepper is Argon2id's secret parameter K (format v3
-/// and later). With `None`, no secret is used, as in older formats.
-pub fn derive_key(
+/// Derives a 256-bit key from the master password, the salt and the pepper
+/// with Argon2id. The pepper is Argon2id's secret parameter K.
+fn derive_key(
     password: &str,
     salt: &[u8; SALT_LEN],
     params: &KdfParams,
-    pepper: Option<&Pepper>,
-) -> Result<Box<Zeroizing<[u8; KEY_LEN]>>> {
+    pepper: &Pepper,
+) -> Result<SecretKey> {
     info!(
-        "deriving key with Argon2id ({} MiB, {} iterations, parallelism {}, {})",
+        "deriving key with Argon2id and the pepper ({} MiB, {} iterations, parallelism {})",
         params.memory_kib / 1024,
         params.iterations,
         params.parallelism,
-        if pepper.is_some() {
-            "with pepper"
-        } else {
-            "without pepper"
-        }
     );
     let start = Instant::now();
 
@@ -622,15 +559,12 @@ pub fn derive_key(
     // Argon2's working memory is derived from the password and is enough to
     // recompute the key: provide it ourselves so that it is wiped afterwards.
     let mut memory = Zeroizing::new(vec![Block::default(); argon2_params.block_count()]);
-    let argon2 = match pepper {
-        Some(pepper) => Argon2::new_with_secret(
-            pepper.as_bytes(),
-            Algorithm::Argon2id,
-            Version::V0x13,
-            argon2_params,
-        )?,
-        None => Argon2::new(Algorithm::Argon2id, Version::V0x13, argon2_params),
-    };
+    let argon2 = Argon2::new_with_secret(
+        pepper.as_bytes(),
+        Algorithm::Argon2id,
+        Version::V0x13,
+        argon2_params,
+    )?;
     let mut key = Box::new(Zeroizing::new([0u8; KEY_LEN]));
     argon2.hash_password_into_with_memory(password.as_bytes(), salt, &mut **key, &mut *memory)?;
 
@@ -643,25 +577,23 @@ impl VaultKey {
     /// Key material for unit tests, without Argon2id (too slow to run in every
     /// test): a random data key and vault id, and a dummy envelope.
     pub(crate) fn for_tests() -> Self {
-        let vault_id = generate_vault_id().expect("vault id");
         let header = Header::new(
             KdfParams::MINIMUM,
             [7u8; SALT_LEN],
             [9u8; crate::pepper::PEPPER_ID_LEN],
-            vault_id,
+            generate_vault_id().expect("vault id"),
         );
         let data_key = DataKey::generate().expect("data key");
-        Self::from_parts(header, vault_id, [0u8; ENVELOPE_LEN], data_key).expect("subkeys")
+        Self::from_parts(header, [0u8; ENVELOPE_LEN], data_key).expect("subkeys")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::HEADER_LEN_V2;
 
-    /// Derives a key with the default parameters (no pepper unless given).
-    fn derive(password: &str, salt: [u8; SALT_LEN], pepper: Option<&Pepper>) -> SecretKey {
+    /// Derives a key with the default parameters.
+    fn derive(password: &str, salt: [u8; SALT_LEN], pepper: &Pepper) -> SecretKey {
         derive_key(password, &salt, &KdfParams::DEFAULT, pepper).expect("derivation")
     }
 
@@ -669,22 +601,25 @@ mod tests {
     // print key bytes.
 
     #[test]
-    fn same_password_and_same_salt_produce_the_same_key() {
+    fn same_password_salt_and_pepper_produce_the_same_key() {
+        let pepper = Pepper::generate().expect("pepper");
         let salt = [7u8; SALT_LEN];
-        assert!(derive("correct horse", salt, None) == derive("correct horse", salt, None));
+        assert!(derive("correct horse", salt, &pepper) == derive("correct horse", salt, &pepper));
     }
 
     #[test]
     fn different_salt_produces_a_different_key() {
-        let k1 = derive("correct horse", [1u8; SALT_LEN], None);
-        let k2 = derive("correct horse", [2u8; SALT_LEN], None);
+        let pepper = Pepper::generate().expect("pepper");
+        let k1 = derive("correct horse", [1u8; SALT_LEN], &pepper);
+        let k2 = derive("correct horse", [2u8; SALT_LEN], &pepper);
         assert!(k1 != k2);
     }
 
     #[test]
     fn different_password_produces_a_different_key() {
+        let pepper = Pepper::generate().expect("pepper");
         let salt = [7u8; SALT_LEN];
-        assert!(derive("correct horse", salt, None) != derive("correct hors3", salt, None));
+        assert!(derive("correct horse", salt, &pepper) != derive("correct hors3", salt, &pepper));
     }
 
     #[test]
@@ -694,10 +629,7 @@ mod tests {
             Pepper::generate().expect("pepper"),
             Pepper::generate().expect("pepper"),
         );
-        let with_a = derive("correct horse", salt, Some(&a));
-        assert!(with_a == derive("correct horse", salt, Some(&a)));
-        assert!(with_a != derive("correct horse", salt, Some(&b)));
-        assert!(with_a != derive("correct horse", salt, None));
+        assert!(derive("correct horse", salt, &a) != derive("correct horse", salt, &b));
     }
 
     #[test]
@@ -770,27 +702,12 @@ mod tests {
             println!("{hex}");
         }
     }
+
     #[test]
-    fn caller_provided_memory_gives_the_standard_argon2_key() {
-        // Providing Argon2's memory ourselves must not change the key,
+    fn derived_key_is_standard_argon2id_with_the_pepper_as_secret() {
+        // The pepper must reach Argon2id as its standard secret K, and
+        // providing Argon2's memory ourselves must not change the key:
         // otherwise existing vaults could no longer be opened.
-        let salt = [7u8; SALT_LEN];
-        let p = KdfParams::DEFAULT;
-        let params = Params::new(p.memory_kib, p.iterations, p.parallelism, Some(KEY_LEN))
-            .expect("valid parameters");
-        let mut expected = [0u8; KEY_LEN];
-        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-            .hash_password_into(b"correct horse", &salt, &mut expected)
-            .expect("derivation");
-
-        let key = derive("correct horse", salt, None);
-        assert!(**key == expected);
-    }
-
-    #[test]
-    fn pepper_is_argon2_secret_parameter() {
-        // The pepper must reach Argon2id as its standard secret K, also when
-        // Argon2's memory is provided by the caller.
         let salt = [7u8; SALT_LEN];
         let pepper = Pepper::generate().expect("pepper");
         let p = KdfParams::DEFAULT;
@@ -807,23 +724,48 @@ mod tests {
         .hash_password_into(b"correct horse", &salt, &mut *expected)
         .expect("derivation");
 
-        let key = derive("correct horse", salt, Some(&pepper));
+        let key = derive("correct horse", salt, &pepper);
         assert!(**key == *expected);
     }
 
     #[test]
     fn out_of_bounds_params_are_rejected() {
-        assert!(KdfParams::DEFAULT.validate().is_ok());
-        assert!(KdfParams::LEGACY.validate().is_ok());
+        for params in [KdfParams::DEFAULT, KdfParams::MINIMUM, KdfParams::MAXIMUM] {
+            assert!(params.validate().is_ok());
+        }
 
-        let too_weak = KdfParams {
-            iterations: 1,
-            ..KdfParams::DEFAULT
-        };
-        assert!(matches!(
-            too_weak.validate(),
-            Err(Error::UnsupportedKdfParams(params)) if params == too_weak
-        ));
+        let (min, max) = (KdfParams::MINIMUM, KdfParams::MAXIMUM);
+        for params in [
+            KdfParams {
+                memory_kib: min.memory_kib - 1,
+                ..min
+            },
+            KdfParams {
+                iterations: min.iterations - 1,
+                ..min
+            },
+            KdfParams {
+                parallelism: min.parallelism - 1,
+                ..min
+            },
+            KdfParams {
+                memory_kib: max.memory_kib + 1,
+                ..max
+            },
+            KdfParams {
+                iterations: max.iterations + 1,
+                ..max
+            },
+            KdfParams {
+                parallelism: max.parallelism + 1,
+                ..max
+            },
+        ] {
+            assert!(matches!(
+                params.validate(),
+                Err(Error::UnsupportedKdfParams(found)) if found == params
+            ));
+        }
     }
 
     #[test]
@@ -866,10 +808,10 @@ mod tests {
     fn new_keys_use_the_current_format_the_pepper_id_and_a_vault_id() {
         let pepper = Pepper::generate().expect("pepper");
         let key = VaultKey::new("correct horse", &pepper).expect("key creation");
-        assert_eq!(key.header.version(), crate::format::FORMAT_VERSION);
-        assert_eq!(key.header.pepper_id(), Some(pepper.id()));
-        assert_eq!(key.header.vault_id(), Some(key.vault_id));
-        assert_eq!(key.prefix().len(), crate::format::HEADER_LEN + ENVELOPE_LEN);
+        assert_eq!(key.header.to_bytes()[5], crate::format::FORMAT_VERSION);
+        assert_eq!(key.header.pepper_id(), pepper.id());
+        assert_eq!(key.header.vault_id(), key.vault_id);
+        assert_eq!(key.prefix().len(), HEADER_LEN + ENVELOPE_LEN);
     }
 
     #[test]
@@ -885,11 +827,25 @@ mod tests {
         let key = key.rewrap("new password", &pepper).expect("rewrap");
         assert_ne!(key.header.salt, old_salt);
         assert_ne!(key.envelope, old_envelope);
-        assert_eq!(key.header.pepper_id(), Some(pepper.id()));
+        assert_eq!(key.header.pepper_id(), pepper.id());
         assert_eq!(key.vault_id, old_vault_id);
-        assert_eq!(key.header.vault_id(), Some(old_vault_id));
+        assert_eq!(key.header.vault_id(), old_vault_id);
         assert!(**key.data_key.0 == *old_data_key);
         assert!(**key.field_key.0 == *old_field_key);
+    }
+
+    #[test]
+    fn rewrap_refuses_another_pepper() {
+        // A new pepper needs a new data key: the same one is never wrapped
+        // again under it. Refused before any derivation.
+        let pepper = Pepper::generate().expect("pepper");
+        let other = Pepper::generate().expect("pepper");
+        let key = VaultKey::new("old password", &pepper).expect("key creation");
+        assert!(matches!(
+            key.rewrap("new password", &other),
+            Err(Error::PepperMismatch { expected, found })
+                if expected == pepper.id() && found == other.id()
+        ));
     }
 
     #[test]
@@ -899,7 +855,7 @@ mod tests {
         let new = old.rotate("new password", &pepper).expect("rotation");
 
         assert_eq!(new.vault_id, old.vault_id);
-        assert_eq!(new.header.vault_id(), Some(old.vault_id));
+        assert_eq!(new.header.vault_id(), old.vault_id);
         assert_ne!(new.header.salt, old.header.salt);
         assert!(**new.data_key.0 != **old.data_key.0);
         assert!(**new.payload_key.0 != **old.payload_key.0);
@@ -919,75 +875,23 @@ mod tests {
         assert!(!key.opens_with("old password", &pepper).expect("derivation"));
     }
 
-    /// A v3 header whose Argon2id parameters Argon2 itself rejects: if the key
-    /// were derived, unlocking would fail with `KeyDerivation`.
-    fn header_that_cannot_be_derived(pepper: &Pepper) -> Header {
-        let params = KdfParams {
-            memory_kib: 0,
-            ..KdfParams::DEFAULT
-        };
-        Header::new(params, [7u8; SALT_LEN], pepper.id(), [5u8; VAULT_ID_LEN])
-    }
-
     #[test]
     fn wrong_pepper_is_rejected_before_key_derivation() {
         let right = Pepper::generate().expect("pepper");
         let wrong = Pepper::generate().expect("pepper");
-        let header = header_that_cannot_be_derived(&right);
+        // Argon2 itself rejects these parameters: if the key were derived,
+        // unlocking would fail with `KeyDerivation` instead.
+        let params = KdfParams {
+            memory_kib: 0,
+            ..KdfParams::DEFAULT
+        };
+        let header = Header::new(params, [7u8; SALT_LEN], right.id(), [5u8; VAULT_ID_LEN]);
 
-        let result = VaultKey::unlock("pw", header, &[0u8; ENVELOPE_LEN], Some(&wrong));
+        let result = VaultKey::unlock("pw", header, &[0u8; ENVELOPE_LEN], &wrong);
         assert!(matches!(
             result,
             Err(Error::PepperMismatch { expected, found })
                 if expected == right.id() && found == wrong.id()
-        ));
-    }
-
-    #[test]
-    fn missing_pepper_is_rejected_before_key_derivation() {
-        let pepper = Pepper::generate().expect("pepper");
-        let header = header_that_cannot_be_derived(&pepper);
-        assert!(matches!(
-            VaultKey::unlock("pw", header, &[0u8; ENVELOPE_LEN], None),
-            Err(Error::PepperRequired)
-        ));
-    }
-
-    /// A v2 header built by hand, with the weakest accepted parameters.
-    fn v2_header() -> (Header, Vec<u8>) {
-        let mut header_bytes = crate::format::MAGIC.to_vec();
-        header_bytes.push(2);
-        for value in [64 * 1024u32, 3, 1] {
-            header_bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        header_bytes.extend_from_slice(&[7u8; SALT_LEN]);
-        assert_eq!(header_bytes.len(), HEADER_LEN_V2);
-        let header = Header::from_bytes(&header_bytes).expect("v2 header");
-        (header, header_bytes)
-    }
-
-    #[test]
-    fn v2_header_is_derived_without_the_pepper() {
-        // A v2 envelope built by hand: KEK without pepper, header as AAD.
-        let (header, header_bytes) = v2_header();
-        let kek = Kek(derive_key("pw", &header.salt, &header.params, None).expect("derivation"));
-        let data_key = DataKey::generate().expect("generation");
-        let envelope = kek.wrap_key(&data_key, &header_bytes).expect("wrap");
-
-        // A pepper given for a v2 header is ignored.
-        let pepper = Pepper::generate().expect("pepper");
-        let unwrapped = unwrap_data_key("pw", &header, &envelope, Some(&pepper)).expect("unwrap");
-        assert!(**unwrapped.0 == **data_key.0);
-    }
-
-    #[test]
-    fn older_headers_cannot_become_a_vault_key() {
-        // Rejected before any derivation: with a derivation, a wrong envelope
-        // would give `DecryptionFailed` instead.
-        let (header, _) = v2_header();
-        assert!(matches!(
-            VaultKey::unlock("pw", header, &[0u8; ENVELOPE_LEN], None),
-            Err(Error::UnsupportedVersion(2))
         ));
     }
 
@@ -1110,12 +1014,11 @@ mod tests {
         let header = Header::new(
             key.header.params,
             key.header.salt,
-            key.header.pepper_id().expect("v4 header"),
+            key.header.pepper_id(),
             other_vault_id,
         );
         let same_data_key = DataKey(Box::new(Zeroizing::new(**key.data_key.0)));
-        let other = VaultKey::from_parts(header, other_vault_id, key.envelope, same_data_key)
-            .expect("subkeys");
+        let other = VaultKey::from_parts(header, key.envelope, same_data_key).expect("subkeys");
         assert!(**other.field_key.0 == **key.field_key.0);
         assert!(matches!(
             other.open_field(entry(1), "password", &field),
