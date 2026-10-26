@@ -19,7 +19,7 @@
 //! `cccc` is the check group: the first 2 bytes of the pepper id. A typo gives
 //! another pepper, whose id almost certainly does not start with these 2 bytes.
 
-use crate::{Error, Result, create_private_dir, to_hex};
+use crate::{Error, Result, create_private_dir, hex, to_hex};
 use log::{debug, info};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -35,7 +35,7 @@ pub const PEPPER_ID_LEN: usize = 16;
 
 /// Domain separation for the pepper id: the id is a hash of the pepper that
 /// is never used for anything else.
-const ID_DOMAIN: &[u8] = b"ArgosPass pepper id v1";
+pub(crate) const ID_DOMAIN: &[u8] = b"ArgosPass pepper id v1";
 
 /// Start of a recovery code. The `1` is the version of the code format.
 const RECOVERY_PREFIX: &str = "ARGOS-PEPPER-1";
@@ -50,9 +50,6 @@ const RECOVERY_GROUP_LEN: usize = 2;
 /// 1 for the check) of 4 hex digits, each one preceded by a `-`.
 const RECOVERY_CODE_LEN: usize = RECOVERY_PREFIX.len()
     + (PEPPER_LEN + RECOVERY_CHECK_LEN) / RECOVERY_GROUP_LEN * (1 + 2 * RECOVERY_GROUP_LEN);
-
-/// Lowercase hex digits, indexed by their value.
-const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 // Reasons given by `Error::InvalidRecoveryCode`. They are fixed texts: the
 // code is the pepper, so no part of it may end up in an error message.
@@ -201,8 +198,7 @@ impl Pepper {
             }
             // Hex by hand: `format!` would build temporary strings that are
             // not wiped.
-            code.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
-            code.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+            hex::push_byte(&mut code, byte);
         }
 
         debug_assert_eq!(code.len(), RECOVERY_CODE_LEN);
@@ -235,10 +231,8 @@ impl Pepper {
         let mut check = [0u8; RECOVERY_CHECK_LEN];
         let mut digits = 0;
         for c in chars {
-            let nibble = match c.to_digit(16) {
-                // Always below 16, so the conversion is lossless.
-                Some(value) => value as u8,
-                None => return Err(Error::InvalidRecoveryCode(NOT_HEX)),
+            let Some(nibble) = hex::nibble(c) else {
+                return Err(Error::InvalidRecoveryCode(NOT_HEX));
             };
             let index = digits / 2;
             let byte = if index < PEPPER_LEN {
@@ -566,7 +560,10 @@ mod tests {
 
         for &i in &positions {
             // Every other digit in this position.
-            for &digit in HEX_DIGITS.iter().filter(|&&d| d != code.as_bytes()[i]) {
+            for &digit in b"0123456789abcdef"
+                .iter()
+                .filter(|&&d| d != code.as_bytes()[i])
+            {
                 let mut typo = code.clone().into_bytes();
                 typo[i] = digit;
                 assert_rejected(&String::from_utf8(typo).expect("ASCII"), CHECK_MISMATCH);

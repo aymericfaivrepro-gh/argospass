@@ -17,10 +17,11 @@ A task is done only when fmt, clippy (with no warnings) and tests all pass. CI r
 ## Layout
 
 - `src/main.rs`: CLI (clap), prompts, clipboard, exit codes. No crypto.
-- `src/lib.rs`: `Entry`, `Vault`, open/save, format migrations, `write_atomic`.
-- `src/crypto.rs`: Argon2id, XChaCha20-Poly1305, `KdfParams`, `Kek`, `DataKey`, `VaultKey`. **The only module that handles keys.**
+- `src/lib.rs`: `Entry`, `EntryId`, `ProtectedField`, `Vault`, open/save, format migrations, `write_atomic`.
+- `src/crypto.rs`: Argon2id, HKDF, XChaCha20-Poly1305, `KdfParams`, `Kek`, `DataKey`, `PayloadKey`, `FieldKey`, `VaultKey`, field AAD (`aad::field`). **The only module that handles keys.**
 - `src/format.rs`: header encoding and validation. `FORMAT_VERSION` is the source of truth for the current format.
 - `src/pepper.rs`: the local pepper file (step 16).
+- `src/hex.rs`: hand-written hex encoding and decoding (recovery code, ids, protected fields).
 - `src/generator.rs`: password generator.
 - `src/error.rs`: error type.
 - `tests/vault.rs`: integration tests on real files.
@@ -30,10 +31,10 @@ A task is done only when fmt, clippy (with no warnings) and tests all pass. CI r
 
 - No custom crypto: RustCrypto crates only. **Ask before adding any dependency.**
 - Randomness comes only from the OS CSPRNG. Every encryption uses a fresh random 24-byte nonce.
-- AAD: the envelope uses the header; the payload uses header ‖ envelope. Everything before a ciphertext is authenticated.
+- AAD: the envelope uses the header; the payload uses header ‖ envelope; a protected field uses `aad::field` (label ‖ vault id ‖ entry id ‖ name length ‖ name). Everything before a ciphertext is authenticated.
 - The KEK only wraps the data key. When key protection gets stronger (format upgrade, pepper, rotation), generate a **new** DataKey. Never rewrap during a migration.
 - Validate the KDF parameters of every header you read, against both the floor and the ceiling, before deriving.
-- Never log, print, `{:?}` or put in an error: passwords, keys, the pepper, plaintext. Public values are fine: sizes, salt, nonce, tag, params, pepper id.
+- Never log, print, `{:?}` or put in an error: passwords, keys, the pepper, plaintext. Public values are fine: sizes, salt, nonce, tag, params, pepper id, vault id, entry ids, field names.
 - Key types use a heap `Box<Zeroizing<[u8; 32]>>`. No `Clone`, `Debug` or `Serialize`. No `Drop` impl on structs that own keys, so moves stay possible.
 - In tests, compare secrets with `assert!`, never `assert_eq!`: a failing `assert_eq!` prints the values.
 - Decryption errors stay indistinct: wrong password and tampered file give the same error.
@@ -57,8 +58,8 @@ Any change to the file layout needs a new `FORMAT_VERSION`, a migration from eve
 
 ## Roadmap
 
-Done: encrypted vault, generator and clipboard, verbose mode, zeroize, versioned header, CI, envelope encryption (v2), `passwd`.
-Current step: 16, the local pepper.
-Next: 17 two-level encryption (HKDF subkeys, per-field AAD), then 18 sync (revisions, merge, rollback detection), then 19 OneDrive and second PC.
+Done: encrypted vault, generator and clipboard, verbose mode, zeroize, versioned header, CI, envelope encryption (v2), `passwd`, local pepper (v3, step 16).
+Current step: 17, two-level encryption (v4: HKDF subkeys, per-field AAD).
+Next: 18 sync (revisions, merge, rollback detection), then 19 OneDrive and second PC.
 
 Work on one step at a time. Do not start the next step.

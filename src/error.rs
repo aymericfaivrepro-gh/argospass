@@ -102,6 +102,16 @@ pub enum Error {
     #[error("key derivation failed")]
     KeyDerivation(#[from] argon2::Error),
 
+    /// HKDF could not derive a subkey (only possible for an output longer
+    /// than 8160 bytes).
+    #[error("subkey derivation failed")]
+    SubkeyDerivation,
+
+    /// A protected field's name does not fit in its associated data (255
+    /// bytes at most). Field names are fixed by the program, never secret.
+    #[error("field name too long: {0} bytes (at most 255)")]
+    FieldNameTooLong(usize),
+
     /// The operating system's random number generator failed.
     #[error("the system random number generator failed")]
     Random(#[from] getrandom::Error),

@@ -1,9 +1,7 @@
 use argospass::crypto::VaultKey;
 use argospass::generator::{self, generate_password};
 use argospass::pepper::{Installed, PEPPER_ID_LEN, Pepper, recovery_code_is_complete, short_id};
-use argospass::{
-    Entry, Error, Vault, create_private_dir, requires_existing_pepper, vault_pepper_id,
-};
+use argospass::{Error, Vault, create_private_dir, requires_existing_pepper, vault_pepper_id};
 use clap::{Parser, Subcommand};
 use log::{LevelFilter, debug, info};
 use std::io::{self, IsTerminal, Read, Write};
@@ -224,7 +222,11 @@ fn exit_code(error: &(dyn std::error::Error + 'static)) -> u8 {
             | Error::PepperRequired
             | Error::DifferentPepperExists { .. } => EXIT_PEPPER,
             Error::InvalidRecoveryCode(_) => EXIT_RECOVERY_CODE,
-            Error::EncryptionFailed | Error::KeyDerivation(_) | Error::Random(_) => EXIT_FAILURE,
+            Error::EncryptionFailed
+            | Error::KeyDerivation(_)
+            | Error::SubkeyDerivation
+            | Error::FieldNameTooLong(_)
+            | Error::Random(_) => EXIT_FAILURE,
         };
     }
     if error.is::<io::Error>() {
@@ -375,7 +377,7 @@ fn change_password(paths: &Paths, rotate_key: bool) -> AppResult {
     let path = paths.vault.as_path();
     require_vault(path)?;
     let pepper = pepper_for_vault(paths)?;
-    let (vault, key) = unlock(path, &pepper)?;
+    let (mut vault, key) = unlock(path, &pepper)?;
 
     if rotate_key {
         eprintln!("Choose the new master password (it may be the current one).");
@@ -392,10 +394,11 @@ fn change_password(paths: &Paths, rotate_key: bool) -> AppResult {
     }
 
     let new_key = if rotate_key {
-        info!("generating a new data key");
-        drop(key); // wipes the old data key now
-        VaultKey::new(&new_password, &pepper)?
+        // Every password is encrypted again with the new field key, before
+        // anything is written: if one fails to open, the vault is unchanged.
+        vault.rotate_key(key, &new_password, &pepper)?
     } else {
+        // Same data key, so same field key: the passwords stay as they are.
         key.rewrap(&new_password, &pepper)?
     };
     vault.save_and_replace_backup(path, &new_key)?;
@@ -647,7 +650,8 @@ fn execute(paths: &Paths, command: Command) -> AppResult {
                 ask_new_password("Entry password: ")?
             };
 
-            vault.add(Entry::new(&title, &username, &password, url.as_deref()))?;
+            // Sealed right away: only the encrypted password is kept in the vault.
+            vault.add(&key, &title, &username, &password, url.as_deref())?;
             vault.save(path, &key)?;
             println!("Entry \"{title}\" added");
             if generate {
@@ -669,10 +673,13 @@ fn execute(paths: &Paths, command: Command) -> AppResult {
             if let Some(url) = entry.url.as_deref().filter(|url| !url.is_empty()) {
                 println!("URL: {url}");
             }
+            // Only this entry's password is decrypted, and wiped at the end
+            // of this block.
+            let password = entry.open_password(&key)?;
             if show {
-                println!("Password: {}", entry.password);
+                println!("Password: {}", *password);
             } else {
-                copy_temporarily(&entry.password)?;
+                copy_temporarily(&password)?;
             }
         }
         Command::Remove { title } => {

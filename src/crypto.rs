@@ -1,13 +1,15 @@
 //! Cryptography: deriving a key from the master password, envelope encryption
-//! and authenticated encryption of the vault.
+//! and the two levels of authenticated encryption of the vault content.
 
-use crate::format::Header;
+use crate::format::{Header, VAULT_ID_LEN};
 use crate::pepper::Pepper;
-use crate::{Error, Result, to_hex};
+use crate::{EntryId, Error, ProtectedField, Result, to_hex};
 use argon2::{Algorithm, Argon2, Block, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use hkdf::Hkdf;
 use log::{debug, info};
+use sha2::Sha256;
 use std::time::Instant;
 use zeroize::Zeroizing;
 
@@ -25,6 +27,18 @@ pub const TAG_LEN: usize = 16;
 
 /// Length of the envelope (the data key wrapped by the KEK): 72 bytes.
 pub const ENVELOPE_LEN: usize = NONCE_LEN + KEY_LEN + TAG_LEN;
+
+// Domain-separation labels. Each one has a single purpose, and none is a
+// prefix of another (checked by a test, with the pepper id's label).
+
+/// HKDF `info` of the payload key (level 1).
+pub(crate) const PAYLOAD_KEY_LABEL: &[u8] = b"ArgosPass payload key v1";
+
+/// HKDF `info` of the field key (level 2).
+pub(crate) const FIELD_KEY_LABEL: &[u8] = b"ArgosPass field key v1";
+
+/// Start of the associated data of every protected field (see [`aad::field`]).
+pub(crate) const FIELD_AAD_LABEL: &[u8] = b"ArgosPass field v1";
 
 /// Argon2id cost parameters, stored in the vault header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,8 +139,11 @@ impl Kek {
     }
 }
 
-/// Data key: random, generated once when the vault is created, and used to
-/// encrypt the entries. Stored in the file wrapped by the [`Kek`].
+/// Data key: random, generated when the vault is created (and again by
+/// `passwd --rotate-key`), and stored in the file wrapped by the [`Kek`].
+///
+/// From format v4 on, it encrypts nothing itself: the [`PayloadKey`] and the
+/// [`FieldKey`] are derived from it.
 pub(crate) struct DataKey(SecretKey);
 
 impl DataKey {
@@ -138,40 +155,93 @@ impl DataKey {
         debug!("generated a new random data key ({KEY_LEN} bytes)");
         Ok(Self(key))
     }
+
+    /// Derives the subkey named by `label` with HKDF-SHA256 (RFC 5869).
+    ///
+    /// No salt: HKDF's salt is meant for input keys that are not uniformly
+    /// random, and the data key already is. The label is HKDF's `info`: two
+    /// labels give two independent keys.
+    fn derive_subkey(&self, label: &[u8]) -> Result<SecretKey> {
+        let hkdf = Hkdf::<Sha256>::new(None, &**self.0);
+        let mut key = Box::new(Zeroizing::new([0u8; KEY_LEN]));
+        // Only fails for outputs longer than 255 hashes (8160 bytes).
+        hkdf.expand(label, &mut **key)
+            .map_err(|_| Error::SubkeyDerivation)?;
+        Ok(key)
+    }
 }
 
-/// Key material of an unlocked vault (envelope encryption).
+/// Payload key (level 1): encrypts the whole JSON content of the vault.
+/// Derived from the [`DataKey`].
+struct PayloadKey(SecretKey);
+
+/// Field key (level 2): encrypts each protected field (the passwords) inside
+/// the JSON content, separately. Derived from the [`DataKey`].
+struct FieldKey(SecretKey);
+
+/// Key material of an unlocked vault.
 ///
 /// The master password and the pepper go through Argon2id to give the `Kek`,
-/// which only unwraps the `DataKey` stored in the envelope. The data key
-/// encrypts the entries. The KEK is wiped as soon as the envelope is opened.
+/// which only unwraps the `DataKey` stored in the envelope. The KEK is wiped as
+/// soon as the envelope is opened. Two subkeys are derived from the data key
+/// with HKDF: the payload key encrypts the JSON content (level 1), and the
+/// field key encrypts each password inside it (level 2), so that opening the
+/// vault does not decrypt every password.
 pub struct VaultKey {
-    /// Salt, Argon2id parameters and pepper id of the KEK.
+    /// Salt, Argon2id parameters, pepper id and vault id.
     pub(crate) header: Header,
+    /// The vault id of the header: every protected field is bound to it.
+    vault_id: [u8; VAULT_ID_LEN],
     /// The data key, wrapped by the KEK. Public: written as is on every save.
     envelope: [u8; ENVELOPE_LEN],
+    /// Only kept to be wrapped again by [`VaultKey::rewrap`].
     data_key: DataKey,
+    payload_key: PayloadKey,
+    field_key: FieldKey,
 }
 
 impl VaultKey {
     /// Creates key material for a new vault: fresh salt, default parameters,
-    /// the id of `pepper`, and a new random data key.
+    /// the id of `pepper`, a new random vault id and a new random data key.
     pub fn new(password: &str, pepper: &Pepper) -> Result<Self> {
         Self::seal(
             password,
-            fresh_header(pepper)?,
+            fresh_header(pepper, generate_vault_id()?)?,
             DataKey::generate()?,
             pepper,
         )
     }
 
     /// Wraps the same data key under a new password, with a fresh salt, the
-    /// current default Argon2 parameters and `pepper`. The content key does
-    /// not change.
+    /// current default Argon2 parameters and `pepper`. The data key, its
+    /// subkeys and the vault id do not change: the protected fields stay
+    /// valid as they are.
     pub fn rewrap(self, new_password: &str, pepper: &Pepper) -> Result<Self> {
         info!("wrapping the data key under the new password");
         // Moves the box: the data key bytes are not copied.
-        Self::seal(new_password, fresh_header(pepper)?, self.data_key, pepper)
+        Self::seal(
+            new_password,
+            fresh_header(pepper, self.vault_id)?,
+            self.data_key,
+            pepper,
+        )
+    }
+
+    /// Creates key material with a new random data key (so new subkeys) under
+    /// `new_password`, for the same vault: the vault id does not change.
+    ///
+    /// `self` is left as it is: every protected field must still be opened
+    /// with it, then sealed again with the new key. Only
+    /// [`Vault::rotate_key`](crate::Vault::rotate_key) calls it, so that the
+    /// second step cannot be forgotten.
+    pub(crate) fn rotate(&self, new_password: &str, pepper: &Pepper) -> Result<Self> {
+        info!("generating a new data key");
+        Self::seal(
+            new_password,
+            fresh_header(pepper, self.vault_id)?,
+            DataKey::generate()?,
+            pepper,
+        )
     }
 
     /// Tells whether `password` (with `pepper`) opens the current envelope,
@@ -182,21 +252,20 @@ impl VaultKey {
     /// keeping the current one in memory.
     pub fn opens_with(&self, password: &str, pepper: &Pepper) -> Result<bool> {
         match Self::unlock(password, self.header, &self.envelope, Some(pepper)) {
-            Ok(_) => Ok(true), // this second copy of the data key is wiped here
+            Ok(_) => Ok(true), // this second copy of the keys is wiped here
             Err(Error::DecryptionFailed) => Ok(false),
             Err(error) => Err(error),
         }
     }
 
-    /// Opens the envelope of an existing vault with the master password.
+    /// Opens the envelope of a vault in the current format with the master
+    /// password and `pepper`.
     ///
-    /// `pepper` is only used if the header has a pepper id (format v3 and
-    /// later): it must then be the pepper with that id.
-    ///
-    /// Fails with [`Error::PepperRequired`] or [`Error::PepperMismatch`] if the
-    /// pepper is missing or is not the vault's, and with
-    /// [`Error::DecryptionFailed`] if the password is wrong or if the header or
-    /// the envelope has been modified.
+    /// Fails with [`Error::UnsupportedVersion`] for an older header (see
+    /// [`open_old_payload`]), with [`Error::PepperRequired`] or
+    /// [`Error::PepperMismatch`] if the pepper is missing or is not the
+    /// vault's, and with [`Error::DecryptionFailed`] if the password is wrong
+    /// or if the header or the envelope has been modified.
     pub(crate) fn unlock(
         password: &str,
         header: Header,
@@ -204,48 +273,45 @@ impl VaultKey {
         pepper: Option<&Pepper>,
     ) -> Result<Self> {
         // Checked before running Argon2id: a malformed file must fail fast.
+        let vault_id = vault_id_of(&header)?;
         let envelope: [u8; ENVELOPE_LEN] = envelope.try_into().map_err(|_| Error::Truncated)?;
 
-        // Also checked before running Argon2id: the pepper id is public, so a
-        // missing or wrong pepper can be reported without a derivation.
-        let pepper = match header.pepper_id() {
-            None => None, // before format v3: derived without a pepper
-            Some(expected) => {
-                let pepper = pepper.ok_or(Error::PepperRequired)?;
-                let found = pepper.id();
-                if found != expected {
-                    return Err(Error::PepperMismatch { expected, found });
-                }
-                Some(pepper)
-            }
-        };
-
-        let data_key = {
-            let kek = Kek::derive(password, &header, pepper)?;
-            kek.unwrap_key(&envelope, &header.to_bytes())?
-        }; // the KEK is wiped here
-        info!("envelope opened");
-
-        Ok(Self {
-            header,
-            envelope,
-            data_key,
-        })
+        let data_key = unwrap_data_key(password, &header, &envelope, pepper)?;
+        Self::from_parts(header, vault_id, envelope, data_key)
     }
 
     /// Wraps `data_key` with the KEK derived from `password`, `header` and
     /// `pepper`, whose id the header must carry.
     fn seal(password: &str, header: Header, data_key: DataKey, pepper: &Pepper) -> Result<Self> {
         debug_assert_eq!(header.pepper_id(), Some(pepper.id()));
+        let vault_id = vault_id_of(&header)?;
         let envelope = {
             let kek = Kek::derive(password, &header, Some(pepper))?;
             kek.wrap_key(&data_key, &header.to_bytes())?
         }; // the KEK is wiped here
 
+        Self::from_parts(header, vault_id, envelope, data_key)
+    }
+
+    /// Assembles the key material of a vault, and derives the two subkeys
+    /// from the data key.
+    fn from_parts(
+        header: Header,
+        vault_id: [u8; VAULT_ID_LEN],
+        envelope: [u8; ENVELOPE_LEN],
+        data_key: DataKey,
+    ) -> Result<Self> {
+        let payload_key = PayloadKey(data_key.derive_subkey(PAYLOAD_KEY_LABEL)?);
+        let field_key = FieldKey(data_key.derive_subkey(FIELD_KEY_LABEL)?);
+        debug!("derived the payload key and the field key from the data key (HKDF-SHA256)");
+
         Ok(Self {
             header,
+            vault_id,
             envelope,
             data_key,
+            payload_key,
+            field_key,
         })
     }
 
@@ -257,26 +323,178 @@ impl VaultKey {
         prefix
     }
 
-    /// Encrypts the vault content with the data key.
+    /// Encrypts the vault content (level 1) with the payload key.
     /// The header and the envelope are authenticated as associated data.
     pub(crate) fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        encrypt(&self.data_key.0, plaintext, &self.prefix())
+        encrypt(&self.payload_key.0, plaintext, &self.prefix())
     }
 
     /// Decrypts a payload produced by [`VaultKey::encrypt`].
     pub(crate) fn decrypt(&self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        decrypt(&self.data_key.0, data, &self.prefix())
+        decrypt(&self.payload_key.0, data, &self.prefix())
+    }
+
+    /// Encrypts one field of an entry (level 2) with the field key.
+    ///
+    /// The associated data binds it to this vault, to the entry and to the
+    /// field name (see [`aad::field`]): it cannot be opened as another field.
+    /// Fails with [`Error::FieldNameTooLong`] if `field_name` is longer than
+    /// 255 bytes.
+    pub fn seal_field(
+        &self,
+        entry_id: EntryId,
+        field_name: &str,
+        plaintext: &str,
+    ) -> Result<ProtectedField> {
+        let aad = aad::field(&self.vault_id, entry_id, field_name)?;
+        debug!("sealing field \"{field_name}\" of entry {entry_id}");
+        // Quietly: the size of the field would give the length of the secret.
+        let sealed = encrypt_quietly(&self.field_key.0, plaintext.as_bytes(), &aad)?;
+        Ok(ProtectedField::from_sealed(sealed))
+    }
+
+    /// Decrypts a field sealed by [`VaultKey::seal_field`], into a buffer that
+    /// is wiped on drop.
+    ///
+    /// Fails with [`Error::DecryptionFailed`] if the field was modified, or
+    /// sealed for another vault, another entry or another field name.
+    pub fn open_field(
+        &self,
+        entry_id: EntryId,
+        field_name: &str,
+        field: &ProtectedField,
+    ) -> Result<Zeroizing<String>> {
+        let aad = aad::field(&self.vault_id, entry_id, field_name)?;
+        debug!("opening field \"{field_name}\" of entry {entry_id}");
+        let mut bytes = decrypt_quietly(&self.field_key.0, field.as_bytes(), &aad)?;
+
+        // Moved out of the wiped buffer, not copied: `String::from_utf8` keeps
+        // the same allocation, which the new `Zeroizing` wipes in turn.
+        match String::from_utf8(std::mem::take(&mut *bytes)) {
+            Ok(text) => Ok(Zeroizing::new(text)),
+            Err(error) => {
+                // Not text, so not sealed by `seal_field`: wipe it all the same.
+                drop(Zeroizing::new(error.into_bytes()));
+                Err(Error::DecryptionFailed)
+            }
+        }
     }
 }
 
-/// Header for a new KEK: fresh random salt, the default Argon2id parameters
-/// and the id of `pepper`.
-fn fresh_header(pepper: &Pepper) -> Result<Header> {
+/// Associated data (AAD) of the encrypted parts of a vault.
+mod aad {
+    use super::{EntryId, Error, FIELD_AAD_LABEL, Result, VAULT_ID_LEN};
+    use crate::ENTRY_ID_LEN;
+
+    /// AAD of a protected field: `"ArgosPass field v1" || vault id (16) ||
+    /// entry id (16) || length of the field name (1 byte) || field name`.
+    ///
+    /// Everything before the name has a fixed size, so the name alone would
+    /// already be unambiguous. The length prefix keeps the encoding
+    /// unambiguous if anything is ever added after the name: without it,
+    /// `"pass" || "word…"` and `"password" || "…"` could give the same bytes.
+    /// Fails with [`Error::FieldNameTooLong`] if the name does not fit in 255
+    /// bytes.
+    pub(super) fn field(
+        vault_id: &[u8; VAULT_ID_LEN],
+        entry_id: EntryId,
+        field_name: &str,
+    ) -> Result<Vec<u8>> {
+        let name = field_name.as_bytes();
+        let name_len = u8::try_from(name.len()).map_err(|_| Error::FieldNameTooLong(name.len()))?;
+
+        let mut aad = Vec::with_capacity(
+            FIELD_AAD_LABEL.len() + VAULT_ID_LEN + ENTRY_ID_LEN + 1 + name.len(),
+        );
+        aad.extend_from_slice(FIELD_AAD_LABEL);
+        aad.extend_from_slice(vault_id);
+        aad.extend_from_slice(entry_id.as_bytes());
+        aad.push(name_len);
+        aad.extend_from_slice(name);
+        Ok(aad)
+    }
+}
+
+/// Returns the vault id of `header`, or fails with
+/// [`Error::UnsupportedVersion`] if its format has none (before v4).
+fn vault_id_of(header: &Header) -> Result<[u8; VAULT_ID_LEN]> {
+    header
+        .vault_id()
+        .ok_or(Error::UnsupportedVersion(header.version()))
+}
+
+/// Unwraps the data key from the envelope of a vault in format v2 or later.
+///
+/// `pepper` is only used if the header has a pepper id (format v3 and
+/// later): it must then be the pepper with that id. Both are checked before
+/// Argon2id runs.
+fn unwrap_data_key(
+    password: &str,
+    header: &Header,
+    envelope: &[u8; ENVELOPE_LEN],
+    pepper: Option<&Pepper>,
+) -> Result<DataKey> {
+    // Checked before running Argon2id: the pepper id is public, so a missing
+    // or wrong pepper can be reported without a derivation.
+    let pepper = match header.pepper_id() {
+        None => None, // before format v3: derived without a pepper
+        Some(expected) => {
+            let pepper = pepper.ok_or(Error::PepperRequired)?;
+            let found = pepper.id();
+            if found != expected {
+                return Err(Error::PepperMismatch { expected, found });
+            }
+            Some(pepper)
+        }
+    };
+
+    let data_key = {
+        let kek = Kek::derive(password, header, pepper)?;
+        kek.unwrap_key(envelope, &header.to_bytes())?
+    }; // the KEK is wiped here
+    info!("envelope opened");
+    Ok(data_key)
+}
+
+/// Decrypts the payload of a vault in format v2 or v3, where the data key
+/// itself encrypted the JSON content, with `header || envelope` as associated
+/// data.
+///
+/// Only for upgrading such a vault: the old data key is wiped before this
+/// returns, and never becomes a [`VaultKey`], so nothing can be encrypted
+/// with it any more. Fails as [`VaultKey::unlock`] does.
+pub(crate) fn open_old_payload(
+    password: &str,
+    header: &Header,
+    envelope: &[u8],
+    payload: &[u8],
+    pepper: Option<&Pepper>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let envelope: [u8; ENVELOPE_LEN] = envelope.try_into().map_err(|_| Error::Truncated)?;
+    let data_key = unwrap_data_key(password, header, &envelope, pepper)?;
+
+    let mut aad = header.to_bytes();
+    aad.extend_from_slice(&envelope);
+    decrypt(&data_key.0, payload, &aad)
+}
+
+/// Header for a new KEK: fresh random salt, the default Argon2id parameters,
+/// the id of `pepper` and `vault_id`.
+fn fresh_header(pepper: &Pepper, vault_id: [u8; VAULT_ID_LEN]) -> Result<Header> {
     Ok(Header::new(
         KdfParams::DEFAULT,
         generate_salt()?,
         pepper.id(),
+        vault_id,
     ))
+}
+
+/// Generates a random vault id using the operating system's CSPRNG.
+fn generate_vault_id() -> Result<[u8; VAULT_ID_LEN]> {
+    let mut vault_id = [0u8; VAULT_ID_LEN];
+    getrandom::fill(&mut vault_id)?;
+    debug!("generated random vault id: {}", to_hex(&vault_id));
+    Ok(vault_id)
 }
 
 /// Generates a random salt using the operating system's CSPRNG.
@@ -291,7 +509,45 @@ pub fn generate_salt() -> Result<[u8; SALT_LEN]> {
 ///
 /// A fresh random nonce is generated on every call.
 /// Output layout: `nonce (24 bytes) || ciphertext || tag (16 bytes)`.
+///
+/// Logs the nonce, the sizes and the tag at `-vv`: for an envelope or a
+/// payload, whose size is visible in the file anyway.
 pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    let output = encrypt_quietly(key, plaintext, aad)?;
+    let (nonce, ciphertext) = output.split_at(NONCE_LEN);
+    debug!("generated random nonce: {}", to_hex(nonce));
+    debug!(
+        "encrypted {} bytes -> {} bytes of ciphertext + tag (tag: {})",
+        plaintext.len(),
+        ciphertext.len(),
+        to_hex(&ciphertext[ciphertext.len() - TAG_LEN..])
+    );
+    Ok(output)
+}
+
+/// Decrypts data produced by [`encrypt`].
+///
+/// Fails with [`Error::DecryptionFailed`] if the key is wrong or if the data
+/// (or the associated data) has been modified.
+///
+/// Logs the nonce, the size and the tag at `-vv`, like [`encrypt`].
+pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    if data.len() < NONCE_LEN + TAG_LEN {
+        return Err(Error::Truncated);
+    }
+    let (nonce, ciphertext) = data.split_at(NONCE_LEN);
+    debug!("nonce (from file): {}", to_hex(nonce));
+    debug!(
+        "verifying Poly1305 tag and decrypting {} bytes (tag: {})",
+        ciphertext.len(),
+        to_hex(&ciphertext[ciphertext.len() - TAG_LEN..])
+    );
+    decrypt_quietly(key, data, aad)
+}
+
+/// [`encrypt`] without any log. For protected fields: the size of one is the
+/// length of the secret it holds, so it must not reach the logs.
+fn encrypt_quietly(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
 
     let mut nonce = [0u8; NONCE_LEN];
@@ -306,35 +562,19 @@ pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<
             },
         )
         .map_err(|_| Error::EncryptionFailed)?;
-    debug!("generated random nonce: {}", to_hex(&nonce));
-    debug!(
-        "encrypted {} bytes -> {} bytes of ciphertext + tag (tag: {})",
-        plaintext.len(),
-        ciphertext.len(),
-        to_hex(&ciphertext[ciphertext.len() - TAG_LEN..])
-    );
     let mut output = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     output.extend_from_slice(&nonce);
     output.extend_from_slice(&ciphertext);
     Ok(output)
 }
 
-/// Decrypts data produced by [`encrypt`].
-///
-/// Fails with [`Error::DecryptionFailed`] if the key is wrong or if the data
-/// (or the associated data) has been modified.
-pub fn decrypt(key: &[u8; KEY_LEN], data: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+/// [`decrypt`] without any log, for the same reason as [`encrypt_quietly`].
+fn decrypt_quietly(key: &[u8; KEY_LEN], data: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if data.len() < NONCE_LEN + TAG_LEN {
         return Err(Error::Truncated);
     }
 
     let (nonce, ciphertext) = data.split_at(NONCE_LEN);
-    debug!("nonce (from file): {}", to_hex(nonce));
-    debug!(
-        "verifying Poly1305 tag and decrypting {} bytes (tag: {})",
-        ciphertext.len(),
-        to_hex(&ciphertext[ciphertext.len() - TAG_LEN..])
-    );
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
 
     cipher
@@ -396,6 +636,23 @@ pub fn derive_key(
 
     info!("key derived in {:?}", start.elapsed());
     Ok(key)
+}
+
+#[cfg(test)]
+impl VaultKey {
+    /// Key material for unit tests, without Argon2id (too slow to run in every
+    /// test): a random data key and vault id, and a dummy envelope.
+    pub(crate) fn for_tests() -> Self {
+        let vault_id = generate_vault_id().expect("vault id");
+        let header = Header::new(
+            KdfParams::MINIMUM,
+            [7u8; SALT_LEN],
+            [9u8; crate::pepper::PEPPER_ID_LEN],
+            vault_id,
+        );
+        let data_key = DataKey::generate().expect("data key");
+        Self::from_parts(header, vault_id, [0u8; ENVELOPE_LEN], data_key).expect("subkeys")
+    }
 }
 
 #[cfg(test)]
@@ -597,35 +854,57 @@ mod tests {
     }
 
     #[test]
-    fn two_vaults_get_different_data_keys() {
+    fn two_vaults_get_different_data_keys_and_vault_ids() {
         let pepper = Pepper::generate().expect("pepper");
         let a = VaultKey::new("correct horse", &pepper).expect("key creation");
         let b = VaultKey::new("correct horse", &pepper).expect("key creation");
         assert!(**a.data_key.0 != **b.data_key.0);
+        assert_ne!(a.vault_id, b.vault_id);
     }
 
     #[test]
-    fn new_keys_use_the_current_format_and_the_pepper_id() {
+    fn new_keys_use_the_current_format_the_pepper_id_and_a_vault_id() {
         let pepper = Pepper::generate().expect("pepper");
         let key = VaultKey::new("correct horse", &pepper).expect("key creation");
         assert_eq!(key.header.version(), crate::format::FORMAT_VERSION);
         assert_eq!(key.header.pepper_id(), Some(pepper.id()));
+        assert_eq!(key.header.vault_id(), Some(key.vault_id));
         assert_eq!(key.prefix().len(), crate::format::HEADER_LEN + ENVELOPE_LEN);
     }
 
     #[test]
-    fn rewrap_keeps_data_key_but_changes_salt_and_envelope() {
+    fn rewrap_keeps_the_keys_and_vault_id_but_changes_salt_and_envelope() {
         let pepper = Pepper::generate().expect("pepper");
         let key = VaultKey::new("old password", &pepper).expect("key creation");
         let old_salt = key.header.salt;
         let old_envelope = key.envelope;
+        let old_vault_id = key.vault_id;
         let old_data_key = Zeroizing::new(**key.data_key.0);
+        let old_field_key = Zeroizing::new(**key.field_key.0);
 
         let key = key.rewrap("new password", &pepper).expect("rewrap");
         assert_ne!(key.header.salt, old_salt);
         assert_ne!(key.envelope, old_envelope);
         assert_eq!(key.header.pepper_id(), Some(pepper.id()));
+        assert_eq!(key.vault_id, old_vault_id);
+        assert_eq!(key.header.vault_id(), Some(old_vault_id));
         assert!(**key.data_key.0 == *old_data_key);
+        assert!(**key.field_key.0 == *old_field_key);
+    }
+
+    #[test]
+    fn rotate_changes_the_keys_but_keeps_the_vault_id() {
+        let pepper = Pepper::generate().expect("pepper");
+        let old = VaultKey::new("old password", &pepper).expect("key creation");
+        let new = old.rotate("new password", &pepper).expect("rotation");
+
+        assert_eq!(new.vault_id, old.vault_id);
+        assert_eq!(new.header.vault_id(), Some(old.vault_id));
+        assert_ne!(new.header.salt, old.header.salt);
+        assert!(**new.data_key.0 != **old.data_key.0);
+        assert!(**new.payload_key.0 != **old.payload_key.0);
+        assert!(**new.field_key.0 != **old.field_key.0);
+        assert!(new.opens_with("new password", &pepper).expect("derivation"));
     }
 
     #[test]
@@ -647,7 +926,7 @@ mod tests {
             memory_kib: 0,
             ..KdfParams::DEFAULT
         };
-        Header::new(params, [7u8; SALT_LEN], pepper.id())
+        Header::new(params, [7u8; SALT_LEN], pepper.id(), [5u8; VAULT_ID_LEN])
     }
 
     #[test]
@@ -674,9 +953,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn v2_header_is_derived_without_the_pepper() {
-        // A v2 vault built by hand: KEK without pepper, header as AAD.
+    /// A v2 header built by hand, with the weakest accepted parameters.
+    fn v2_header() -> (Header, Vec<u8>) {
         let mut header_bytes = crate::format::MAGIC.to_vec();
         header_bytes.push(2);
         for value in [64 * 1024u32, 3, 1] {
@@ -685,15 +963,32 @@ mod tests {
         header_bytes.extend_from_slice(&[7u8; SALT_LEN]);
         assert_eq!(header_bytes.len(), HEADER_LEN_V2);
         let header = Header::from_bytes(&header_bytes).expect("v2 header");
+        (header, header_bytes)
+    }
 
+    #[test]
+    fn v2_header_is_derived_without_the_pepper() {
+        // A v2 envelope built by hand: KEK without pepper, header as AAD.
+        let (header, header_bytes) = v2_header();
         let kek = Kek(derive_key("pw", &header.salt, &header.params, None).expect("derivation"));
         let data_key = DataKey::generate().expect("generation");
         let envelope = kek.wrap_key(&data_key, &header_bytes).expect("wrap");
 
         // A pepper given for a v2 header is ignored.
         let pepper = Pepper::generate().expect("pepper");
-        let key = VaultKey::unlock("pw", header, &envelope, Some(&pepper)).expect("unlock");
-        assert!(**key.data_key.0 == **data_key.0);
+        let unwrapped = unwrap_data_key("pw", &header, &envelope, Some(&pepper)).expect("unwrap");
+        assert!(**unwrapped.0 == **data_key.0);
+    }
+
+    #[test]
+    fn older_headers_cannot_become_a_vault_key() {
+        // Rejected before any derivation: with a derivation, a wrong envelope
+        // would give `DecryptionFailed` instead.
+        let (header, _) = v2_header();
+        assert!(matches!(
+            VaultKey::unlock("pw", header, &[0u8; ENVELOPE_LEN], None),
+            Err(Error::UnsupportedVersion(2))
+        ));
     }
 
     #[test]
@@ -704,6 +999,181 @@ mod tests {
         assert!(matches!(
             decrypt(&key, &encrypted, b"header v2"),
             Err(Error::DecryptionFailed)
+        ));
+    }
+
+    // Two-level encryption (format v4).
+
+    /// An entry id for tests.
+    fn entry(byte: u8) -> EntryId {
+        EntryId::from_bytes([byte; crate::ENTRY_ID_LEN])
+    }
+
+    #[test]
+    fn subkeys_match_their_definition() {
+        // Part of the file format: computed independently with Python's
+        // hmac and hashlib, following RFC 5869 (no salt: 32 zero bytes).
+        let data_key = DataKey(Box::new(Zeroizing::new([0x42; KEY_LEN])));
+        let payload_key = data_key.derive_subkey(PAYLOAD_KEY_LABEL).expect("HKDF");
+        let field_key = data_key.derive_subkey(FIELD_KEY_LABEL).expect("HKDF");
+        // Test values: compared as hex with `assert!` all the same.
+        assert!(
+            to_hex(&**payload_key)
+                == "7fee9ae1a306253e3a28f70cf1fed2e5c345bc67ecce4f40d1f5ee6c19da7a6f"
+        );
+        assert!(
+            to_hex(&**field_key)
+                == "127d370b3505552370f181dc1bdc7498cc04d91b2ddbbcf9289d49614257e39f"
+        );
+    }
+
+    #[test]
+    fn payload_key_field_key_and_data_key_all_differ() {
+        let key = VaultKey::for_tests();
+        assert!(**key.payload_key.0 != **key.field_key.0);
+        assert!(**key.payload_key.0 != **key.data_key.0);
+        assert!(**key.field_key.0 != **key.data_key.0);
+    }
+
+    #[test]
+    fn labels_are_distinct_and_none_is_a_prefix_of_another() {
+        // A label is followed by other data in the hash, HKDF or AAD input:
+        // a label that starts another one could give the same bytes.
+        let labels = [
+            PAYLOAD_KEY_LABEL,
+            FIELD_KEY_LABEL,
+            FIELD_AAD_LABEL,
+            crate::pepper::ID_DOMAIN,
+        ];
+        for (i, a) in labels.iter().enumerate() {
+            for (j, b) in labels.iter().enumerate() {
+                if i != j {
+                    assert!(!b.starts_with(a), "{a:?} starts {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn payload_is_encrypted_with_the_payload_key_not_the_data_key() {
+        let key = VaultKey::for_tests();
+        let payload = key.encrypt(b"{}").expect("encryption");
+        assert!(key.decrypt(&payload).is_ok());
+        assert!(matches!(
+            decrypt(&key.data_key.0, &payload, &key.prefix()),
+            Err(Error::DecryptionFailed)
+        ));
+        assert!(decrypt(&key.payload_key.0, &payload, &key.prefix()).is_ok());
+    }
+
+    #[test]
+    fn field_round_trip() {
+        let key = VaultKey::for_tests();
+        let field = key
+            .seal_field(entry(1), "password", "correct horse")
+            .expect("seal");
+        // nonce || ciphertext (as long as the text) || tag
+        assert_eq!(field.as_bytes().len(), NONCE_LEN + 13 + TAG_LEN);
+        assert!(!field.as_bytes().windows(5).any(|w| w == b"horse"));
+
+        let opened = key.open_field(entry(1), "password", &field).expect("open");
+        assert!(*opened == "correct horse");
+    }
+
+    #[test]
+    fn sealing_the_same_text_twice_gives_different_fields() {
+        let key = VaultKey::for_tests();
+        let a = key.seal_field(entry(1), "password", "same").expect("seal");
+        let b = key.seal_field(entry(1), "password", "same").expect("seal");
+        assert!(a.as_bytes() != b.as_bytes());
+    }
+
+    #[test]
+    fn a_field_only_opens_as_the_field_it_was_sealed_as() {
+        let key = VaultKey::for_tests();
+        let field = key
+            .seal_field(entry(1), "password", "secret")
+            .expect("seal");
+
+        // Another entry, or another field name.
+        for (entry_id, name) in [(entry(2), "password"), (entry(1), "username")] {
+            assert!(matches!(
+                key.open_field(entry_id, name, &field),
+                Err(Error::DecryptionFailed)
+            ));
+        }
+
+        // Another vault with the very same keys: only the vault id differs,
+        // so only the associated data can make it fail.
+        let other_vault_id = [0xee; VAULT_ID_LEN];
+        assert_ne!(other_vault_id, key.vault_id);
+        let header = Header::new(
+            key.header.params,
+            key.header.salt,
+            key.header.pepper_id().expect("v4 header"),
+            other_vault_id,
+        );
+        let same_data_key = DataKey(Box::new(Zeroizing::new(**key.data_key.0)));
+        let other = VaultKey::from_parts(header, other_vault_id, key.envelope, same_data_key)
+            .expect("subkeys");
+        assert!(**other.field_key.0 == **key.field_key.0);
+        assert!(matches!(
+            other.open_field(entry(1), "password", &field),
+            Err(Error::DecryptionFailed)
+        ));
+
+        // A modified byte.
+        let mut bytes = field.as_bytes().to_vec();
+        bytes[NONCE_LEN] ^= 0x01;
+        let tampered = ProtectedField::from_sealed(bytes);
+        assert!(matches!(
+            key.open_field(entry(1), "password", &tampered),
+            Err(Error::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn field_aad_has_the_documented_layout() {
+        let aad = aad::field(&[1u8; VAULT_ID_LEN], entry(2), "password").expect("AAD");
+        let mut expected = b"ArgosPass field v1".to_vec();
+        expected.extend_from_slice(&[1u8; VAULT_ID_LEN]);
+        expected.extend_from_slice(&[2u8; crate::ENTRY_ID_LEN]);
+        expected.push(8);
+        expected.extend_from_slice(b"password");
+        assert_eq!(aad, expected);
+        assert_eq!(aad.len(), 18 + 16 + 16 + 1 + 8);
+    }
+
+    #[test]
+    fn field_names_that_start_one_another_give_different_aads() {
+        // With the name last, these would differ even without the length
+        // prefix (see `aad::field`): the prefix is what keeps them apart if
+        // anything is ever added after the name.
+        let vault_id = [1u8; VAULT_ID_LEN];
+        let pairs = [("pass", "password"), ("", "\0"), ("a", "a\u{1}")];
+        for (short, long) in pairs {
+            let a = aad::field(&vault_id, entry(2), short).expect("AAD");
+            let b = aad::field(&vault_id, entry(2), long).expect("AAD");
+            assert_ne!(a, b);
+            // The byte right after the ids is the length, not the name.
+            let at = FIELD_AAD_LABEL.len() + VAULT_ID_LEN + crate::ENTRY_ID_LEN;
+            assert_eq!(usize::from(a[at]), short.len());
+            assert_eq!(usize::from(b[at]), long.len());
+        }
+    }
+
+    #[test]
+    fn field_names_longer_than_255_bytes_are_rejected() {
+        let key = VaultKey::for_tests();
+        assert!(key.seal_field(entry(1), &"a".repeat(255), "x").is_ok());
+        assert!(matches!(
+            key.seal_field(entry(1), &"a".repeat(256), "x"),
+            Err(Error::FieldNameTooLong(256))
+        ));
+        // In bytes, not characters: 128 two-byte characters are 256 bytes.
+        assert!(matches!(
+            key.seal_field(entry(1), &"é".repeat(128), "x"),
+            Err(Error::FieldNameTooLong(256))
         ));
     }
 }

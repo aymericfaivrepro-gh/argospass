@@ -1,6 +1,6 @@
 # ArgosPass
 
-A command-line password manager written in Rust. Entries live in a single local file, encrypted with a random key that only your master password, together with a local pepper file, can unlock.
+A command-line password manager written in Rust. Entries live in a single local file, encrypted with a random key that only your master password, together with a local pepper file, can unlock. Each password is encrypted a second time on its own, so that opening the vault does not decrypt them all.
 
 > ⚠️ **Personal learning project.** ArgosPass is still in development and it has not been audited by a third party. Use it at your own risk and keep backups of your vault.
 
@@ -54,7 +54,7 @@ argospass --help                                      # full help (also: argospa
 | `get <TITLE>` | Copy the entry's password to the clipboard and clear it after 20 seconds. `--show` prints it instead. | Yes |
 | `remove <TITLE>` | Delete an entry | Yes |
 | `generate` | Print a random password: 24 characters by default (minimum 8), symbols included unless `--no-symbols` is given | No |
-| `passwd [--rotate-key]` | Change the master password. `--rotate-key` also generates a new data key. Without `--rotate-key`, the new password must differ from the current one. See [Changing the master password](#changing-the-master-password). | Yes, then chooses the new one |
+| `passwd [--rotate-key]` | Change the master password. `--rotate-key` also generates a new data key, and encrypts every password again with it. Without `--rotate-key`, the new password must differ from the current one. See [Changing the master password](#changing-the-master-password). | Yes, then chooses the new one |
 | `pepper status` | Show the pepper file, its id, and whether it matches the vault. See [Pepper recovery code](#pepper-recovery-code). | No |
 | `pepper export` | Print the pepper as a recovery code, to write down or move to another computer | No |
 | `pepper import` | Rebuild the pepper file from its recovery code, read from stdin or typed with hidden input. Never overwrites an existing pepper file. | No |
@@ -74,7 +74,7 @@ The clipboard is only cleared if it still contains the password ArgosPass put th
 | `-v` | Show the main steps (key derivation time, file read/written…) |
 | `-vv` | Show every detail (sizes, salt, nonces, tags, Argon2 parameters, generator statistics…) |
 
-Logs go to **stderr**, so they never mix with a command's output. They only show public values. The master password, keys, decrypted content and entry passwords are never logged.
+Logs go to **stderr**, so they never mix with a command's output. They only show public values. The master password, keys, decrypted content and entry passwords are never logged. Neither is the size of an encrypted password: it would give the length of the password.
 
 ### Vault and pepper locations
 
@@ -169,7 +169,7 @@ Never send the code or the pepper file through the cloud, e-mail or a chat, even
 | **Crash or power loss during a save** | Atomic write: the old vault stays intact until the new one is fully on disk, and a `.bak` copy is kept. |
 | **Other users of the same machine** | On Unix, the vault is created with `600` permissions and its directory with `700`. |
 | **Shoulder surfing and shell history** | Passwords are never command-line arguments and are typed with hidden input. By default, `get` copies to the clipboard instead of printing. |
-| **Secrets lingering in memory** | Keys, decrypted content and passwords are overwritten when no longer needed (see [Secrets in memory](#secrets-in-memory)). |
+| **Secrets lingering in memory** | Keys, decrypted content and passwords are overwritten when no longer needed (see [Secrets in memory](#secrets-in-memory)). The passwords stay encrypted in memory, and are decrypted one at a time (see [What the two levels of encryption add](#what-the-two-levels-of-encryption-add)). |
 
 ### What the pepper adds
 
@@ -181,6 +181,15 @@ The pepper is a 256-bit random secret, stored in its own file and never in the v
 - **Losing it means losing the vault.** Back it up separately from the vault, for example as a [recovery code](#pepper-recovery-code) on paper (see [Pepper file](#pepper-file)).
 
 The vault header stores a pepper **id**: the first 16 bytes of SHA-256(`"ArgosPass pepper id v1"` ‖ pepper). It is public and reveals nothing usable about the pepper, but it lets ArgosPass tell a wrong pepper file from a wrong password, before any key derivation.
+
+### What the two levels of encryption add
+
+From format v4 on, each password is encrypted a second time, on its own, inside the encrypted content (see [Key hierarchy](#key-hierarchy)).
+
+- **It limits the passwords in clear in memory.** Opening the vault decrypts the content (titles, usernames, URLs), not the passwords. `list` decrypts none, and `get` only the one asked for, wiped right after use. A partial leak of memory (a page written to swap, a bug that prints the content) is much less likely to reveal a password.
+- **It does not resist a full memory dump** (a core dump, a debugger, malware) taken while ArgosPass runs: the field key is in memory, next to the encrypted passwords. Nor does it help against anyone who has the master password and the pepper, or against a compromised machine.
+- **Each password is bound to its place.** Its associated data holds the vault id, the entry id and the field name: it cannot be opened as the password of another entry, or of another vault. Since the whole content is already authenticated, this mostly guards against bugs today. It will matter once entries from several copies of a vault are merged (sync). It does not tell an older version of the same password from the current one: an old copy of the field, put back in place, still opens. Telling them apart is left to the revisions that sync will add.
+- **It adds nothing on disk:** the passwords in the file were already encrypted, by the payload layer.
 
 ### What ArgosPass does not protect against
 
@@ -198,18 +207,37 @@ Only audited, widely used implementations from the [RustCrypto](https://github.c
 | --- | --- | --- |
 | Key derivation from the master password and the pepper | **Argon2id** (RFC 9106), version 0x13, with the pepper as secret parameter K | `argon2` |
 | Pepper id | **SHA-256**, truncated to 16 bytes | `sha2` |
-| Authenticated encryption (of the data key and of the entries) | **XChaCha20-Poly1305** (AEAD) | `chacha20poly1305` |
-| Randomness (salt, nonces, data key, pepper, generated passwords) | Operating system CSPRNG | `getrandom` |
+| Subkeys of the data key (payload key, field key) | **HKDF-SHA256** (RFC 5869), without salt, one label per subkey | `hkdf` |
+| Authenticated encryption (of the data key, of the content, and of each password) | **XChaCha20-Poly1305** (AEAD) | `chacha20poly1305` |
+| Randomness (salt, nonces, data key, vault id, entry ids, pepper, generated passwords) | Operating system CSPRNG | `getrandom` |
 | Memory wiping | Volatile writes that the compiler cannot optimize away | `zeroize` |
 
-### Two keys: envelope encryption
+### Key hierarchy
 
-ArgosPass uses two 256-bit keys:
+ArgosPass uses four 256-bit keys:
 
 - the **key-encryption key (KEK)** is derived from the master password and the pepper with Argon2id. Its only job is to encrypt the data key;
-- the **data key** is drawn at random when the vault is created and never changes. It encrypts the entries.
+- the **data key** is drawn at random when the vault is created, and only changes with `passwd --rotate-key`. The data key, encrypted with the KEK, is stored in the file: this is the **envelope**. From format v4 on, the data key encrypts nothing itself;
+- the **payload key** and the **field key** are derived from the data key with HKDF-SHA256, each with its own label. They are independent: knowing one tells nothing about the other, nor about the data key.
 
-The data key, encrypted with the KEK, is stored in the file: this is the **envelope**.
+```
+master password ─┐
+pepper ──────────┼─► Argon2id ─► KEK ─► opens the envelope ─► data key
+salt, parameters ┘                                               │
+                                                     HKDF-SHA256, no salt
+                                   ┌─────────────────────────────┴───────────────────┐
+                    "ArgosPass payload key v1"                       "ArgosPass field key v1"
+                                   ▼                                                 ▼
+                      payload key (level 1)                             field key (level 2)
+                  encrypts the JSON content                   encrypts each password inside it
+```
+
+| Level | Key | Encrypts | Associated data (authenticated, not encrypted) |
+| --- | --- | --- | --- |
+| 1 | Payload key | The whole JSON content | `header ‖ envelope` |
+| 2 | Field key | Each password, separately, with its own nonce | `"ArgosPass field v1" ‖ vault id (16) ‖ entry id (16) ‖ length of the field name (1 byte) ‖ field name` |
+
+HKDF takes no salt here: its salt is meant for input keys that are not uniformly random, and the data key is. In the associated data of a password, the field name is the only part whose size varies; its length prefix keeps the encoding unambiguous if anything is ever added after it.
 
 ### How a vault is opened
 
@@ -223,39 +251,43 @@ envelope ────────────────► XChaCha20-Poly1305 
                                     │  verify tag, decrypt
                                     ▼
                                 data key
+                                    │  HKDF-SHA256 ("ArgosPass payload key v1")
+                                    ▼
+                               payload key
                                     │
                                     ▼
 payload ─────────────────► XChaCha20-Poly1305 ◄── AAD: header ‖ envelope
                                     │  verify tag, decrypt
                                     ▼
-                              JSON entries
+                  JSON entries (passwords still encrypted)
 ```
 
 1. ArgosPass reads the header and checks the magic bytes, the format version, the Argon2 parameters and the file length, all before any key derivation.
 2. It also checks that the pepper id in the header is the id of the pepper file, still before any derivation. Otherwise it stops: wrong or missing pepper (exit code `8`). The command line already does this check from the header alone before asking for the master password; it is done again here because the id is only authenticated by the envelope's tag, and the file may have changed in between.
 3. The master password, the pepper and the salt go through Argon2id with the parameters from the header. The output is the KEK.
 4. The KEK opens the envelope: XChaCha20-Poly1305 checks the envelope's tag over the encrypted data key **and the header**, then decrypts the data key. The KEK is wiped right away.
-5. The data key decrypts the payload. Its tag covers the ciphertext **and everything before it** (header and envelope).
+5. The payload key, derived from the data key, decrypts the payload. Its tag covers the ciphertext **and everything before it** (header and envelope).
 6. If a tag does not match (wrong password, modified file), nothing is decrypted, and the error does not say which of the two happened.
+7. The passwords stay encrypted. `get` decrypts only the one asked for, with the field key: its tag also covers the vault id, the entry id and the field name.
 
 ### How a vault is saved
 
-1. The entries are serialized to JSON into a buffer that will be wiped afterwards.
+1. The entries are serialized to JSON into a buffer that will be wiped afterwards. Their passwords are already encrypted: each one was sealed with the field key, with its own fresh nonce, as soon as it was added.
 2. A new random 24-byte nonce is generated. **Every save uses a fresh nonce**, so the payload changes completely even when its content does not.
-3. The JSON is encrypted with the data key, with the header and the envelope as associated data.
+3. The JSON is encrypted with the payload key, with the header and the envelope as associated data.
 4. The file (`header ‖ envelope ‖ new payload`) is written atomically (see [Atomic writes](#atomic-writes)).
 
-Saving needs neither the master password nor Argon2id: the data key is kept in memory while the command runs, and the header and the envelope are written back unchanged. The salt and the parameters only change with the master password, and the data key only with `passwd --rotate-key`.
+Saving needs neither the master password nor Argon2id: the keys are kept in memory while the command runs, and the header and the envelope are written back unchanged. The salt and the parameters only change with the master password, the data key only with `passwd --rotate-key`, and the vault id never.
 
 ### Changing the master password
 
 1. `passwd` unlocks the vault with the current password, then asks for the new one twice.
 2. Without `--rotate-key`, a new password identical to the current one is refused: keeping both the password and the data key would bring no security. The current password is not kept in memory for this: ArgosPass tries the new password on the current envelope, which costs one more Argon2id run. With `--rotate-key`, the same password is accepted.
-3. A new KEK is derived from the new password, with a **new salt**, the current default Argon2 parameters and the same pepper: `passwd` never changes the pepper.
-4. The same data key is wrapped with the new KEK. With `--rotate-key`, a new random data key is generated instead.
+3. A new KEK is derived from the new password, with a **new salt**, the current default Argon2 parameters and the same pepper: `passwd` never changes the pepper, nor the vault id.
+4. The same data key is wrapped with the new KEK. Its subkeys do not change, so the encrypted passwords are kept as they are. With `--rotate-key`, a new random data key is generated instead, which gives a new payload key and a new field key: **every password is decrypted with the old field key and encrypted again with the new one**, before anything is written. If one of them fails to open, nothing is written.
 5. The vault is saved, then the `.bak` backup is replaced by the new version.
 
-**Plain `passwd` or `--rotate-key`?** A plain `passwd` keeps the data key. Someone who already got the data key, from a copy of the vault made before the change and the old password, can still decrypt every later version of the vault, whatever the new password. Only `--rotate-key` revokes them: the entries are then encrypted with a new key, and an old copy only reveals the entries as they were when it was made. Use `--rotate-key` if the old password may have leaked.
+**Plain `passwd` or `--rotate-key`?** A plain `passwd` keeps the data key. Someone who already got the data key, from a copy of the vault made before the change and the old password, can still decrypt every later version of the vault, whatever the new password. Only `--rotate-key` revokes them: the content and every password are then encrypted with new keys, and an old copy only reveals the entries as they were when it was made. Use `--rotate-key` if the old password may have leaked.
 
 `--rotate-key` also accepts the current password as the new one, to replace only the data key, for example if the data key alone may have been exposed. This does not help if the password itself may have leaked: whoever knows it can open the new vault too. Choose a new password in that case.
 
@@ -297,56 +329,63 @@ Each character is chosen with **rejection sampling**: random bytes that would ma
 
 ## Vault file format
 
-### Version 3 (current)
+### Version 4 (current)
 
 | Offset | Size | Part | Field |
 | --- | --- | --- | --- |
 | 0 | 5 | Header | Magic bytes `ARGOS`, to recognize the file |
-| 5 | 1 | Header | Format version (`3`) |
+| 5 | 1 | Header | Format version (`4`) |
 | 6 | 4 | Header | Argon2 memory in KiB (little-endian) |
 | 10 | 4 | Header | Argon2 iterations (little-endian) |
 | 14 | 4 | Header | Argon2 parallelism (little-endian) |
 | 18 | 16 | Header | Random salt |
 | 34 | 16 | Header | Pepper id (see [What the pepper adds](#what-the-pepper-adds)) |
-| 50 | 24 | Envelope | Random nonce |
-| 74 | 32 | Envelope | Data key, encrypted with the KEK |
-| 106 | 16 | Envelope | Poly1305 authentication tag |
-| 122 | 24 | Payload | Random nonce |
-| 146 | n | Payload | Encrypted JSON |
-| 146 + n | 16 | Payload | Poly1305 authentication tag |
+| 50 | 16 | Header | Vault id: random, drawn when the vault is created, never changed |
+| 66 | 24 | Envelope | Random nonce |
+| 90 | 32 | Envelope | Data key, encrypted with the KEK |
+| 122 | 16 | Envelope | Poly1305 authentication tag |
+| 138 | 24 | Payload | Random nonce |
+| 162 | n | Payload | JSON content, encrypted with the payload key (see [Decrypted content](#decrypted-content)) |
+| 162 + n | 16 | Payload | Poly1305 authentication tag |
 
-The header (50 bytes) and the envelope (72 bytes) are stored **in clear**, since they are needed to unlock the vault, but they are **authenticated**: the header is the associated data of the envelope, and the header and the envelope together are the associated data of the payload. Changing a single bit anywhere makes opening fail. An empty vault takes 176 bytes.
+The header (66 bytes) and the envelope (72 bytes) are stored **in clear**, since they are needed to unlock the vault, but they are **authenticated**: the header is the associated data of the envelope, and the header and the envelope together are the associated data of the payload. Changing a single bit anywhere makes opening fail. An empty vault takes 192 bytes.
 
-The salt, the nonces and the pepper id are not secret. The salt and the nonces must be unique: the salt makes each vault's KEK different even with the same password and pepper (and rules out precomputed tables), and the nonces make each encryption different. The pepper itself is never in the file.
+The salt, the nonces, the pepper id and the vault id are not secret. The salt and the nonces must be unique: the salt makes each vault's KEK different even with the same password and pepper (and rules out precomputed tables), and the nonces make each encryption different. The vault id is kept by `passwd`, with or without `--rotate-key`: every encrypted password is bound to it. The pepper itself is never in the file.
 
 ### Older formats (upgraded automatically)
 
-Vaults in an older format are still opened, without the pepper, then **automatically re-saved in version 3**: with a new salt, the current Argon2 parameters, the pepper (created if there is none yet), and a **new random data key**. The old key is never reused: with an old copy and the password, it would otherwise decrypt the new vault without the pepper. The `.bak` backup is replaced by the new version too, so that no copy without the pepper is left next to the vault. A warning is shown, only after the vault was decrypted successfully. Copies kept elsewhere still open without the pepper.
+Vaults in an older format are still opened (without the pepper before version 3), then **automatically re-saved in version 4**: with a new salt, the current Argon2 parameters, the pepper (created if there is none yet), a **new random data key** and a new vault id. Each entry gets an id, and its password is encrypted on its own with the field key. The old key is never reused: a key that protected a weaker format (without the pepper, or with every password in clear in the decrypted content) could otherwise still open the new vault. The `.bak` backup is replaced by the new version too, so that no copy in the old format is left next to the vault. A warning is shown, only after the vault was decrypted successfully. Copies kept elsewhere stay in their old format: those older than version 3 still open without the pepper.
 
 | Version | Layout | Empty vault |
 | --- | --- | --- |
+| 3 | Header of 50 bytes (no vault id), then the same envelope and payload as version 4, but the data key itself encrypts the JSON, and the passwords are in clear inside it. | 176 bytes |
 | 2 | Header of 34 bytes (no pepper id), then the same envelope and payload as version 3. The KEK is derived without a pepper. | 160 bytes |
 | 1 | Same 34-byte header (with version `1`), followed directly by `nonce (24) ‖ encrypted JSON ‖ tag (16)`: the entries are encrypted with the key derived from the master password, with the header as associated data. | 88 bytes |
 | 0 (legacy) | `salt (16) ‖ nonce (24) ‖ ciphertext ‖ tag (16)`, with no header (no magic bytes) and no associated data, opened with the default parameters of the time. | 70 bytes |
 
 ### Decrypted content
 
-Once decrypted, the vault is a JSON document:
+Once the payload is decrypted (level 1), the vault is a JSON document:
 
 ```json
 {
   "entries": [
     {
+      "id": "6f1c0e2a9b5d4c3e8a7f6b5c4d3e2f10",
       "title": "GitHub",
       "username": "User",
-      "password": "password",
+      "password": "<hex: nonce (24 bytes) ‖ encrypted password ‖ tag (16 bytes)>",
       "url": "https://github.com"
     }
   ]
 }
 ```
 
-This plaintext only ever exists in memory. It is never written to disk.
+- `id` is the entry id: 16 random bytes in hex, drawn when the entry is added and never changed.
+- `password` is a **protected field** (level 2): the password encrypted with the field key, in hex. A password of `m` bytes takes `2 × (24 + m + 16)` hex digits: 128 for a generated password of 24 characters. Its associated data is described in [Key hierarchy](#key-hierarchy).
+- The title, the username and the URL are only protected by the payload encryption.
+
+This JSON only ever exists in memory. It is never written to disk.
 
 ### Atomic writes
 
@@ -366,15 +405,17 @@ When freed, memory is not erased: secrets could remain in RAM, then end up in a 
 | Secret | Protection |
 | --- | --- |
 | Key-encryption key (KEK) | `Box<Zeroizing<[u8; 32]>>`: stored once on the heap (never copied around the stack). Wiped right after opening (or creating) the envelope, so it is never kept while the vault is open |
-| Data key | `Box<Zeroizing<[u8; 32]>>`: drawn at random directly into a zeroed heap buffer, or decrypted into a `Zeroizing<Vec<u8>>` and copied into one, so it never touches the stack. Kept while the command runs (saving needs it) and wiped on drop |
+| Data key | `Box<Zeroizing<[u8; 32]>>`: drawn at random directly into a zeroed heap buffer, or decrypted into a `Zeroizing<Vec<u8>>` and copied into one, so it never touches the stack. Kept while the command runs (`passwd` wraps it again) and wiped on drop. It encrypts nothing itself |
+| Payload key and field key | `Box<Zeroizing<[u8; 32]>>`: HKDF writes them directly into a zeroed heap buffer. Kept while the command runs (saving and `get` need them) and wiped on drop |
 | Pepper | `Box<Zeroizing<[u8; 32]>>`: drawn at random, read from its file, or decoded from its recovery code, directly into a zeroed heap buffer. Kept while the command runs (opening and `passwd` need it) and wiped on drop |
 | Recovery code | `pepper export` builds it in a `Zeroizing<String>` of exactly its size. `pepper import` reads it into a pre-sized `Zeroizing<Vec<u8>>` (stdin) or `Zeroizing<String>` (typed, but see [Known limitations](#known-limitations)), then decodes it character by character straight into the pepper's buffer, with no copy of its own |
-| Keys of the old formats (v2, v1, legacy) | Wiped right after decrypting the old file, before the upgrade |
+| Keys of the old formats (v3, v2, v1, legacy) | Wiped right after decrypting the old file, before the upgrade. They never become a `VaultKey`, so nothing new can be encrypted with them |
 | Key copy inside the cipher | Each XChaCha20-Poly1305 instance keeps its own copy of the key. It only lives for one encryption or decryption, and the `chacha20poly1305` crate wipes it on drop |
 | Argon2 working memory (128 MiB by default) | Allocated by ArgosPass in a `Zeroizing` buffer and wiped after the derivation. The `argon2` crate would otherwise free it without wiping it. |
-| Decrypted JSON | `Zeroizing<Vec<u8>>` |
+| Decrypted JSON | `Zeroizing<Vec<u8>>`. From format v4 on, it holds no password: they stay encrypted inside it |
 | JSON before encryption | Exact size computed first, so the buffer never reallocates and leaves no unwiped copies behind |
-| Entries | `Entry` implements `ZeroizeOnDrop`: every field is wiped when the entry is dropped |
+| Entries | `Entry` implements `ZeroizeOnDrop`: every field is wiped when the entry is dropped. Its password stays encrypted (`ProtectedField`) |
+| Entry passwords in clear | Only `get` decrypts one, for the entry asked for, into a `Zeroizing<String>` that reuses the decryption buffer (no copy). It is wiped right after the copy to the clipboard or the display. `add` encrypts the typed or generated password right away. `passwd --rotate-key` decrypts each password only for the time of encrypting it again. While an old vault is upgraded, its passwords are in clear in its old entries (`ZeroizeOnDrop` too) until the upgrade ends |
 | Master passwords (current and new), generated passwords, clipboard read-back | `Zeroizing<String>`. The current password is wiped as soon as the vault is unlocked, even by `passwd` |
 
 ## Known limitations
@@ -384,10 +425,11 @@ When freed, memory is not erased: secrets could remain in RAM, then end up in a 
 - **Typed secrets:** `rpassword`, which reads hidden input, grows its buffer one character at a time, and each reallocation leaves the previous, unwiped copy in freed memory. A master password, or a recovery code typed or pasted on the terminal, may therefore leave partial copies behind. A recovery code read from stdin does not.
 - **Standard input and output buffers:** the Rust standard library keeps what goes through stdin and stdout in buffers that ArgosPass cannot wipe. A recovery code read from stdin, and a password or recovery code printed by `generate`, `get --show` or `pepper export`, stay there until the command exits.
 - **Ctrl+C during `get`:** interrupting the 20-second countdown leaves the password in the clipboard.
-- **Whole vault decrypted at once:** every entry is in clear in memory while a command runs, not only the one you asked for.
+- **Content decrypted at once:** the titles, usernames and URLs of every entry are in clear in memory while a command runs. The passwords are not (see [What the two levels of encryption add](#what-the-two-levels-of-encryption-add)), except the one `get` shows, each one in turn during `passwd --rotate-key`, and all of them while an old vault is upgraded.
 - **No rollback protection** and **file size not hidden** (see [Security model](#security-model)).
+- **Upgrading an old vault:** the old content holds the passwords in clear. While it is read, `serde_json` unescapes a string that contains an escaped character (`\"`, `\\`, `\uXXXX`…) into an internal buffer that is not wiped: such a password may stay in freed memory.
 - **Old copies keep the old password:** copies of the vault made before a password change (cloud history, backups, other computers) still open with the old password, and copies made before the pepper (format v2 and older) open without it.
-- **Hash states are not wiped:** the `sha2` and `blake2` crates do not wipe their internal state. Computing the pepper id (SHA-256), and Argon2id's first step (Blake2b over the password and the pepper), may leave short-lived copies of these secrets on the stack.
+- **Hash states are not wiped:** the `sha2`, `blake2`, `hmac` and `hkdf` crates do not wipe their internal state. Computing the pepper id (SHA-256), Argon2id's first step (Blake2b over the password and the pepper), and deriving the subkeys (HMAC-SHA256 over the data key itself, then keyed with a value derived from it and as secret as it) may leave short-lived copies of these secrets on the stack.
 
 ## Development
 
@@ -406,9 +448,10 @@ The CI (`.github/workflows/ci.yml`) runs the same checks on every push.
 ```
 src/
 ├── main.rs        command-line interface (clap), prompts, clipboard, exit codes
-├── lib.rs         Entry, Vault, open/save, atomic writes
-├── crypto.rs      Argon2id derivation, envelope encryption (KEK, data key), XChaCha20-Poly1305, KdfParams, VaultKey
+├── lib.rs         Entry, EntryId, ProtectedField, Vault, open/save, format upgrades, atomic writes
+├── crypto.rs      Argon2id derivation, envelope encryption (KEK, data key), HKDF subkeys (payload key, field key), XChaCha20-Poly1305, KdfParams, VaultKey
 ├── format.rs      vault header: serialization, parsing, validation, format versions
+├── hex.rs         hexadecimal encoding and decoding, written by hand
 ├── pepper.rs      pepper file: generation, creation, loading, id, recovery code, import
 ├── generator.rs   password generator
 └── error.rs       error type
@@ -425,17 +468,20 @@ Unit tests live next to the code they test. Integration tests in `tests/vault.rs
 - no secret appears in clear in the file;
 - the backup is kept and no temporary file is left behind;
 - the file has `600` permissions (Unix only);
-- new vaults use format v3 (176 bytes when empty), with the pepper id at offset 34;
+- new vaults use format v4 (192 bytes when empty), with the pepper id at offset 34 and a random vault id at offset 50;
+- the decrypted JSON content (level 1) holds no password: the test decrypts it on its own, from the documented format (Argon2id, envelope, HKDF with the label written out), and finds each password as a protected field in hex, of the expected size;
 - a wrong pepper is rejected before any key derivation, and a wrong password with the right pepper as before;
 - through the binary, a wrong pepper is rejected (exit code `8`) before the master password is asked for, by `list` and `passwd`;
-- a modified header, pepper id or envelope is rejected;
-- v2, v1 and legacy vaults are upgraded to v3, their backup included, and then only open with the pepper;
-- after a password change (with or without `--rotate-key`), the vault and its backup open with the new password only, and the backup keeps `600` permissions;
+- a modified header, pepper id, vault id or envelope is rejected;
+- v3, v2, v1 and legacy vaults are upgraded to v4, their backup included, with a new data key, and then only open with the pepper; the passwords of the old vaults built by hand can still be read, and none is left in clear in the decrypted content; a wrong password leaves an old file byte for byte unchanged; two entries with the same title (possible in a file edited by hand) are both kept;
+- after a password change (with or without `--rotate-key`), the vault and its backup open with the new password only, the vault id is kept, and the backup keeps `600` permissions; a plain `passwd` keeps every encrypted password byte for byte, and `--rotate-key` encrypts every one of them again, under a new data key;
 - a lost pepper file is rebuilt from its recovery code, and the vault opens again;
 - importing a pepper never overwrites another pepper file (left byte for byte identical), and importing the installed pepper writes nothing;
 - the pepper id of a vault is read from its header alone, and is absent before format v3;
 - a vault in a newer format is reported as unsupported (exit code `4`), not as missing its pepper, and no pepper file is created for it;
 - through the binary: `pepper status`, `pepper export` (the code on stdout only, never on stderr, with a warning if the file it goes to is accessible to other users), and `pepper import` from stdin, which rejects a code with a typo (exit code `9`) and never replaces another pepper (exit code `8`).
+
+The unit tests of `crypto.rs` check the two levels of encryption: the subkeys against values computed independently (Python's `hmac`, following RFC 5869), that the payload key, the field key and the data key all differ, that no label is a prefix of another, that a password only opens for its own vault, entry and field name, the exact layout of its associated data, the 255-byte limit on field names, and that the payload is not encrypted with the data key itself. Those of `lib.rs` check that re-encrypting the passwords for `--rotate-key` is all or nothing, and that malformed ids and protected fields are rejected.
 
 The unit tests of `pepper.rs` also check the recovery code: its exact layout, that letter case, spaces and line breaks are tolerated, that a wrong prefix, a wrong length, a character that is not a hex digit, and every single-digit typo or swap of two neighbouring digits (for a fixed pepper) are rejected, and that a code typed over several lines is complete only with its last line.
 

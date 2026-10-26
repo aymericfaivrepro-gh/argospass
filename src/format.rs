@@ -9,6 +9,7 @@
 //!     14     4  Argon2id parallelism       (u32, little-endian)
 //!     18    16  salt
 //!     34    16  pepper id (format v3 and later only)
+//!     50    16  vault id  (format v4 and later only)
 //! ```
 //!
 //! The header is stored in clear but authenticated: it is passed as
@@ -19,8 +20,13 @@
 //!   the master password. Still read, and upgraded to the current version.
 //! - v2: `envelope || nonce || encrypted JSON || tag`, see
 //!   [`VaultKey`](crate::crypto::VaultKey). Still read, and upgraded.
-//! - v3 (current): same as v2, but the KEK is also derived from the
-//!   [`Pepper`](crate::pepper::Pepper), whose id the header stores.
+//! - v3: same as v2, but the KEK is also derived from the
+//!   [`Pepper`](crate::pepper::Pepper), whose id the header stores. Still
+//!   read, and upgraded.
+//! - v4 (current): same layout as v3, but the payload is encrypted with a
+//!   subkey of the data key, and each password inside it is encrypted again
+//!   with another subkey, bound to the vault id (see
+//!   [`VaultKey`](crate::crypto::VaultKey)).
 
 use crate::crypto::{KdfParams, SALT_LEN};
 use crate::pepper::PEPPER_ID_LEN;
@@ -30,7 +36,7 @@ use crate::{Error, Result};
 pub const MAGIC: &[u8; 5] = b"ARGOS";
 
 /// Current version of the file format, used for every new header.
-pub const FORMAT_VERSION: u8 = 3;
+pub const FORMAT_VERSION: u8 = 4;
 
 /// Oldest format version that can still be opened (and is then upgraded).
 pub const OLDEST_SUPPORTED_VERSION: u8 = 1;
@@ -38,23 +44,34 @@ pub const OLDEST_SUPPORTED_VERSION: u8 = 1;
 /// First format version whose key derivation uses a pepper.
 pub const FIRST_PEPPER_VERSION: u8 = 3;
 
+/// First format version whose header has a vault id.
+pub const FIRST_VAULT_ID_VERSION: u8 = 4;
+
+/// Size of the vault id: 16 bytes.
+pub const VAULT_ID_LEN: usize = 16;
+
 const VERSION_OFFSET: usize = 5;
 const MEMORY_OFFSET: usize = 6;
 const ITERATIONS_OFFSET: usize = 10;
 const PARALLELISM_OFFSET: usize = 14;
 const SALT_OFFSET: usize = 18;
 const PEPPER_ID_OFFSET: usize = 34;
+const VAULT_ID_OFFSET: usize = 50;
 
 /// Header length of format versions 1 and 2, in bytes.
 pub const HEADER_LEN_V2: usize = SALT_OFFSET + SALT_LEN;
 
+/// Header length of format version 3, in bytes.
+pub const HEADER_LEN_V3: usize = PEPPER_ID_OFFSET + PEPPER_ID_LEN;
+
 /// Header length of the current format version, in bytes.
-pub const HEADER_LEN: usize = PEPPER_ID_OFFSET + PEPPER_ID_LEN;
+pub const HEADER_LEN: usize = VAULT_ID_OFFSET + VAULT_ID_LEN;
 
 /// Public, authenticated information needed to derive the vault key.
 ///
-/// Invariant: `pepper_id` is `Some` exactly when `version` is at least
-/// [`FIRST_PEPPER_VERSION`]. The two fields are private so that only
+/// Invariants: `pepper_id` is `Some` exactly when `version` is at least
+/// [`FIRST_PEPPER_VERSION`], and `vault_id` exactly when it is at least
+/// [`FIRST_VAULT_ID_VERSION`]. These fields are private so that only
 /// [`Header::new`] and [`Header::from_bytes`] can set them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
@@ -66,17 +83,25 @@ pub struct Header {
     version: u8,
     /// Id of the pepper the key is derived with (public).
     pepper_id: Option<[u8; PEPPER_ID_LEN]>,
+    /// Random id of the vault, kept for its whole life (public).
+    vault_id: Option<[u8; VAULT_ID_LEN]>,
 }
 
 impl Header {
     /// Creates a header in the current format, for a key derived with the
-    /// pepper whose id is `pepper_id`.
-    pub fn new(params: KdfParams, salt: [u8; SALT_LEN], pepper_id: [u8; PEPPER_ID_LEN]) -> Self {
+    /// pepper whose id is `pepper_id`, in the vault whose id is `vault_id`.
+    pub fn new(
+        params: KdfParams,
+        salt: [u8; SALT_LEN],
+        pepper_id: [u8; PEPPER_ID_LEN],
+        vault_id: [u8; VAULT_ID_LEN],
+    ) -> Self {
         Self {
             params,
             salt,
             version: FORMAT_VERSION,
             pepper_id: Some(pepper_id),
+            vault_id: Some(vault_id),
         }
     }
 
@@ -90,10 +115,17 @@ impl Header {
         self.pepper_id
     }
 
+    /// Id of the vault, or `None` before format v4.
+    pub fn vault_id(&self) -> Option<[u8; VAULT_ID_LEN]> {
+        self.vault_id
+    }
+
     /// Length of the header in its own format version, in bytes.
     pub fn encoded_len(&self) -> usize {
-        if self.version >= FIRST_PEPPER_VERSION {
+        if self.version >= FIRST_VAULT_ID_VERSION {
             HEADER_LEN
+        } else if self.version >= FIRST_PEPPER_VERSION {
+            HEADER_LEN_V3
         } else {
             HEADER_LEN_V2
         }
@@ -113,6 +145,9 @@ impl Header {
         out.extend_from_slice(&self.salt);
         if let Some(pepper_id) = &self.pepper_id {
             out.extend_from_slice(pepper_id);
+        }
+        if let Some(vault_id) = &self.vault_id {
+            out.extend_from_slice(vault_id);
         }
         debug_assert_eq!(out.len(), self.encoded_len());
         out
@@ -135,11 +170,24 @@ impl Header {
             return Err(Error::UnsupportedVersion(version));
         }
 
+        // `try_into` turns a slice of the right length into an array.
         let pepper_id = if version >= FIRST_PEPPER_VERSION {
-            let pepper_id = data
-                .get(PEPPER_ID_OFFSET..HEADER_LEN)
-                .ok_or(Error::Truncated)?;
-            Some(pepper_id.try_into().expect("slice of PEPPER_ID_LEN bytes"))
+            let pepper_id = data.get(PEPPER_ID_OFFSET..HEADER_LEN_V3);
+            Some(
+                pepper_id
+                    .and_then(|id| id.try_into().ok())
+                    .ok_or(Error::Truncated)?,
+            )
+        } else {
+            None
+        };
+        let vault_id = if version >= FIRST_VAULT_ID_VERSION {
+            let vault_id = data.get(VAULT_ID_OFFSET..HEADER_LEN);
+            Some(
+                vault_id
+                    .and_then(|id| id.try_into().ok())
+                    .ok_or(Error::Truncated)?,
+            )
         } else {
             None
         };
@@ -160,6 +208,7 @@ impl Header {
             salt,
             version,
             pepper_id,
+            vault_id,
         })
     }
 }
@@ -177,7 +226,12 @@ mod tests {
     use super::*;
 
     fn sample_header() -> Header {
-        Header::new(KdfParams::DEFAULT, [7u8; SALT_LEN], [9u8; PEPPER_ID_LEN])
+        Header::new(
+            KdfParams::DEFAULT,
+            [7u8; SALT_LEN],
+            [9u8; PEPPER_ID_LEN],
+            [5u8; VAULT_ID_LEN],
+        )
     }
 
     /// A header in format `version` 1 or 2, built byte by byte.
@@ -191,13 +245,24 @@ mod tests {
         bytes
     }
 
+    /// A header in format v3: the v2 fields, then the pepper id.
+    fn sample_v3_bytes() -> Vec<u8> {
+        let mut bytes = sample_v2_bytes(3);
+        bytes.extend_from_slice(&[9u8; PEPPER_ID_LEN]);
+        bytes
+    }
+
     #[test]
     fn round_trip() {
         let header = sample_header();
         let bytes = header.to_bytes();
         assert_eq!(bytes.len(), HEADER_LEN);
-        assert_eq!(HEADER_LEN, 50);
-        assert_eq!(&bytes[PEPPER_ID_OFFSET..], &[9u8; PEPPER_ID_LEN]);
+        assert_eq!(HEADER_LEN, 66);
+        assert_eq!(
+            &bytes[PEPPER_ID_OFFSET..VAULT_ID_OFFSET],
+            &[9u8; PEPPER_ID_LEN]
+        );
+        assert_eq!(&bytes[VAULT_ID_OFFSET..], &[5u8; VAULT_ID_LEN]);
 
         let parsed = Header::from_bytes(&bytes).expect("valid header");
         assert_eq!(parsed, header);
@@ -211,16 +276,26 @@ mod tests {
             let header = Header::from_bytes(&bytes).expect("valid header");
             assert_eq!(header.version(), version);
             assert_eq!(header.pepper_id(), None);
+            assert_eq!(header.vault_id(), None);
             assert_eq!(header.encoded_len(), HEADER_LEN_V2);
             assert_eq!(header.to_bytes(), bytes);
         }
+
+        let bytes = sample_v3_bytes();
+        let header = Header::from_bytes(&bytes).expect("valid header");
+        assert_eq!(header.version(), 3);
+        assert_eq!(header.pepper_id(), Some([9u8; PEPPER_ID_LEN]));
+        assert_eq!(header.vault_id(), None);
+        assert_eq!(header.encoded_len(), HEADER_LEN_V3);
+        assert_eq!(header.to_bytes(), bytes);
     }
 
     #[test]
-    fn new_headers_use_the_current_version_and_a_pepper() {
+    fn new_headers_use_the_current_version_a_pepper_and_a_vault_id() {
         let header = sample_header();
         assert_eq!(header.version(), FORMAT_VERSION);
         assert!(header.pepper_id().is_some());
+        assert_eq!(header.vault_id(), Some([5u8; VAULT_ID_LEN]));
 
         let bytes = header.to_bytes();
         assert_eq!(&bytes[..5], b"ARGOS");
@@ -257,8 +332,19 @@ mod tests {
 
     #[test]
     fn rejects_v3_header_without_its_pepper_id() {
+        let bytes = sample_v3_bytes();
+        for len in [HEADER_LEN_V2, HEADER_LEN_V3 - 1] {
+            assert!(matches!(
+                Header::from_bytes(&bytes[..len]),
+                Err(Error::Truncated)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_v4_header_without_its_vault_id() {
         let bytes = sample_header().to_bytes();
-        for len in [HEADER_LEN_V2, HEADER_LEN - 1] {
+        for len in [HEADER_LEN_V2, HEADER_LEN_V3, HEADER_LEN - 1] {
             assert!(matches!(
                 Header::from_bytes(&bytes[..len]),
                 Err(Error::Truncated)
