@@ -3,11 +3,12 @@
 use argospass::crypto::VaultKey;
 use argospass::crypto::{ENVELOPE_LEN, KEY_LEN, KdfParams, SALT_LEN, derive_key, encrypt};
 use argospass::format::{HEADER_LEN, HEADER_LEN_V2, MAGIC};
-use argospass::pepper::{PEPPER_ID_LEN, Pepper};
-use argospass::{Entry, Error, Vault, requires_existing_pepper};
+use argospass::pepper::{Installed, PEPPER_ID_LEN, Pepper, short_id};
+use argospass::{Entry, Error, Vault, requires_existing_pepper, vault_pepper_id};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 
 /// Offset of the pepper id in a v3 header.
 const PEPPER_ID_OFFSET: usize = HEADER_LEN - PEPPER_ID_LEN;
@@ -17,11 +18,18 @@ fn temp_vault(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("argospass-test-{name}.argos"))
 }
 
+/// Returns the path of a pepper file in the system temp directory, unique to
+/// each test, with no file left over by an interrupted run.
+fn temp_pepper_path(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("argospass-test-{name}.key"));
+    let _ = fs::remove_file(&path);
+    path
+}
+
 /// Creates a pepper in its own temporary file, unique to each test, and reads
 /// it back. The file is deleted right away: the tests only need the pepper.
 fn temp_pepper(name: &str) -> Pepper {
-    let path = std::env::temp_dir().join(format!("argospass-test-{name}.key"));
-    let _ = fs::remove_file(&path); // left over by an interrupted run
+    let path = temp_pepper_path(name);
     Pepper::create(&path).expect("pepper creation should succeed");
     let pepper = Pepper::load(&path).expect("pepper should load");
     fs::remove_file(&path).expect("cleanup should succeed");
@@ -504,4 +512,321 @@ fn password_change_with_key_rotation() {
 
     fs::remove_file(&path).expect("cleanup should succeed");
     fs::remove_file(&backup).expect("cleanup should succeed");
+}
+
+/// The recovery code of the pepper made of 32 bytes `0x42`. Its check group
+/// catches every single-digit typo (see the unit tests of `pepper.rs`), so
+/// the typo tests below cannot pass by chance.
+fn sample_code() -> String {
+    format!("ARGOS-PEPPER-1{}-a112", "-4242".repeat(16))
+}
+
+#[test]
+fn lost_pepper_is_restored_from_its_recovery_code() {
+    let path = temp_vault("recovery");
+    let pepper_path = temp_pepper_path("recovery");
+
+    // As `init` does: the pepper file first, then a vault created with it.
+    let pepper = Pepper::create(&pepper_path).expect("pepper creation should succeed");
+    let key = VaultKey::new("master", &pepper).expect("key derivation should succeed");
+    let mut vault = Vault::new();
+    vault
+        .add(Entry::new("Gmail", "me@gmail.com", "secret", None))
+        .expect("add should succeed");
+    vault.save(&path, &key).expect("save should succeed");
+    let code = pepper.to_recovery_code(); // `pepper export`
+    drop(pepper);
+
+    // The pepper file is lost: the vault cannot be opened any more.
+    fs::remove_file(&pepper_path).expect("delete should succeed");
+    assert!(matches!(
+        Pepper::load(&pepper_path),
+        Err(Error::PepperMissing(_))
+    ));
+
+    // `pepper import`
+    let imported = Pepper::from_recovery_code(&code).expect("the code should decode");
+    assert_eq!(
+        imported
+            .install(&pepper_path)
+            .expect("install should succeed"),
+        Installed::Created
+    );
+
+    let restored = Pepper::load(&pepper_path).expect("the restored pepper should load");
+    let (opened, _) = Vault::open(&path, "master", &restored).expect("the vault should open");
+    let entry = opened.get("Gmail").expect("entry should exist");
+    assert!(entry.password == "secret");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&pepper_path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    fs::remove_file(&path).expect("cleanup should succeed");
+    fs::remove_file(&pepper_path).expect("cleanup should succeed");
+}
+
+#[test]
+fn import_never_overwrites_another_pepper() {
+    let pepper_path = temp_pepper_path("import-other");
+    let installed = Pepper::create(&pepper_path).expect("pepper creation should succeed");
+    let before = fs::read(&pepper_path).expect("read should succeed");
+
+    let other = Pepper::from_recovery_code(&sample_code()).expect("the code should decode");
+    assert!(matches!(
+        other.install(&pepper_path),
+        Err(Error::DifferentPepperExists { path, existing })
+            if path == pepper_path && existing == installed.id()
+    ));
+    // Byte for byte the same file (compared with `assert!`: it is the pepper).
+    assert!(fs::read(&pepper_path).expect("read should succeed") == before);
+
+    // A file that is not a pepper is not replaced either.
+    fs::write(&pepper_path, b"not a pepper").expect("write should succeed");
+    assert!(matches!(
+        other.install(&pepper_path),
+        Err(Error::InvalidPepper { .. })
+    ));
+    assert_eq!(
+        fs::read(&pepper_path).expect("read should succeed"),
+        b"not a pepper"
+    );
+
+    fs::remove_file(&pepper_path).expect("cleanup should succeed");
+}
+
+#[test]
+fn importing_the_installed_pepper_writes_nothing() {
+    let pepper_path = temp_pepper_path("import-same");
+    let pepper = Pepper::create(&pepper_path).expect("pepper creation should succeed");
+    let before = fs::read(&pepper_path).expect("read should succeed");
+    let modified = fs::metadata(&pepper_path)
+        .and_then(|m| m.modified())
+        .expect("modification time");
+
+    let imported =
+        Pepper::from_recovery_code(&pepper.to_recovery_code()).expect("the code should decode");
+    assert_eq!(
+        imported
+            .install(&pepper_path)
+            .expect("the same pepper is a success"),
+        Installed::AlreadyPresent
+    );
+
+    assert!(fs::read(&pepper_path).expect("read should succeed") == before);
+    let after = fs::metadata(&pepper_path)
+        .and_then(|m| m.modified())
+        .expect("modification time");
+    assert_eq!(after, modified);
+
+    fs::remove_file(&pepper_path).expect("cleanup should succeed");
+}
+
+#[test]
+fn vault_pepper_id_reads_only_the_header() {
+    // Format v3: the id of the pepper, read without any password.
+    let v3_path = temp_vault("pepper-id-v3");
+    let pepper = temp_pepper("pepper-id-v3");
+    let key = VaultKey::new("master", &pepper).expect("key derivation should succeed");
+    Vault::new()
+        .save(&v3_path, &key)
+        .expect("save should succeed");
+    assert_eq!(
+        vault_pepper_id(&v3_path).expect("read should succeed"),
+        Some(pepper.id())
+    );
+
+    // Format v2 has no pepper. Nothing is decrypted: random bytes after the
+    // header are enough.
+    let v2_path = temp_vault("pepper-id-v2");
+    let mut v2 = old_header(2, &[7u8; SALT_LEN]);
+    v2.extend_from_slice(&[0xaa; ENVELOPE_LEN + 24 + 16]);
+    fs::write(&v2_path, &v2).expect("write should succeed");
+    assert_eq!(
+        vault_pepper_id(&v2_path).expect("read should succeed"),
+        None
+    );
+
+    // The legacy layout has no header at all.
+    let legacy_path = temp_vault("pepper-id-legacy");
+    fs::write(&legacy_path, [0x55; 70]).expect("write should succeed");
+    assert_eq!(
+        vault_pepper_id(&legacy_path).expect("read should succeed"),
+        None
+    );
+
+    // The header is validated as when opening.
+    let mut data = fs::read(&v3_path).expect("read should succeed");
+    data[6..10].copy_from_slice(&u32::MAX.to_le_bytes()); // memory cost: 4 TiB
+    fs::write(&v3_path, &data).expect("write should succeed");
+    assert!(matches!(
+        vault_pepper_id(&v3_path),
+        Err(Error::UnsupportedKdfParams(_))
+    ));
+
+    for path in [v3_path, v2_path, legacy_path] {
+        fs::remove_file(&path).expect("cleanup should succeed");
+    }
+}
+
+/// The `argospass` binary, on a test vault and pepper. Both paths are always
+/// given, so that the real vault and pepper are never used.
+fn cli(vault: &Path, pepper: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_argospass"));
+    command
+        .arg("--vault")
+        .arg(vault)
+        .arg("--pepper")
+        .arg(pepper)
+        .args(args)
+        .env_remove("ARGOSPASS_VAULT")
+        .env_remove("ARGOSPASS_PEPPER");
+    command
+}
+
+/// Runs the binary (see [`cli`]) with `stdin` as its standard input.
+fn run_cli(vault: &Path, pepper: &Path, args: &[&str], stdin: &[u8]) -> Output {
+    let mut child = cli(vault, pepper, args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary should start");
+    // Dropping stdin right after writing closes it: the binary sees the end.
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(stdin)
+        .expect("write to stdin should succeed");
+    child.wait_with_output().expect("the binary should finish")
+}
+
+#[test]
+fn cli_exports_then_imports_the_pepper() {
+    let path = temp_vault("cli-recovery");
+    let pepper_path = temp_pepper_path("cli-recovery");
+    let pepper = Pepper::create(&pepper_path).expect("pepper creation should succeed");
+    let key = VaultKey::new("master", &pepper).expect("key derivation should succeed");
+    Vault::new().save(&path, &key).expect("save should succeed");
+    let id = short_id(&pepper.id());
+
+    let status = run_cli(&path, &pepper_path, &["pepper", "status"], b"");
+    assert!(status.status.success());
+    let stdout = String::from_utf8(status.stdout).expect("UTF-8 output");
+    assert!(stdout.contains(&id));
+    assert!(stdout.contains("the pepper matches this vault"));
+
+    // The code on stdout and nothing else; stderr never shows it.
+    let export = run_cli(&path, &pepper_path, &["pepper", "export"], b"");
+    assert!(export.status.success());
+    let code = pepper.to_recovery_code();
+    assert!(export.stdout == format!("{}\n", *code).into_bytes());
+    let stderr = String::from_utf8(export.stderr).expect("UTF-8 output");
+    assert!(!stderr.contains(code.as_str()));
+    assert!(stderr.contains(&id));
+
+    fs::remove_file(&pepper_path).expect("delete should succeed");
+    let status = run_cli(&path, &pepper_path, &["pepper", "status"], b"");
+    assert!(status.status.success());
+    let stdout = String::from_utf8(status.stdout).expect("UTF-8 output");
+    assert!(stdout.contains("there is no pepper file"));
+
+    // The code goes through stdin, as with `pepper import < code.txt`.
+    let import = run_cli(&path, &pepper_path, &["pepper", "import"], &export.stdout);
+    assert!(import.status.success());
+    let stdout = String::from_utf8(import.stdout).expect("UTF-8 output");
+    assert!(stdout.contains("installed"));
+    assert!(stdout.contains("the pepper matches this vault"));
+    let restored = Pepper::load(&pepper_path).expect("the restored pepper should load");
+    assert!(Vault::open(&path, "master", &restored).is_ok());
+
+    // Importing it again is a success that writes nothing.
+    let again = run_cli(&path, &pepper_path, &["pepper", "import"], &export.stdout);
+    assert!(again.status.success());
+    let stdout = String::from_utf8(again.stdout).expect("UTF-8 output");
+    assert!(stdout.contains("already installed"));
+
+    fs::remove_file(&path).expect("cleanup should succeed");
+    fs::remove_file(&pepper_path).expect("cleanup should succeed");
+}
+
+#[test]
+fn cli_rejects_a_recovery_code_with_a_typo() {
+    let path = temp_vault("cli-typo");
+    let pepper_path = temp_pepper_path("cli-typo");
+
+    // The first digit of the first group: 4 -> 5.
+    let typo = sample_code().replacen("-4242", "-5242", 1);
+    let import = run_cli(&path, &pepper_path, &["pepper", "import"], typo.as_bytes());
+    assert_eq!(import.status.code(), Some(9));
+    assert!(!pepper_path.exists());
+    let stderr = String::from_utf8(import.stderr).expect("UTF-8 output");
+    assert!(stderr.contains("check group"));
+    assert!(!stderr.contains("5242"));
+
+    // The same code without the typo is accepted.
+    let import = run_cli(
+        &path,
+        &pepper_path,
+        &["pepper", "import"],
+        sample_code().as_bytes(),
+    );
+    assert!(import.status.success());
+    assert!(pepper_path.exists());
+
+    // But never over another pepper.
+    fs::remove_file(&pepper_path).expect("delete should succeed");
+    Pepper::create(&pepper_path).expect("pepper creation should succeed");
+    let before = fs::read(&pepper_path).expect("read should succeed");
+    let import = run_cli(
+        &path,
+        &pepper_path,
+        &["pepper", "import"],
+        sample_code().as_bytes(),
+    );
+    assert_eq!(import.status.code(), Some(8));
+    assert!(fs::read(&pepper_path).expect("read should succeed") == before);
+
+    fs::remove_file(&pepper_path).expect("cleanup should succeed");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_warns_when_the_code_is_exported_to_a_file_others_can_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temp_vault("cli-export-file"); // never created: not needed
+    let pepper_path = temp_pepper_path("cli-export-file");
+    let pepper = Pepper::create(&pepper_path).expect("pepper creation should succeed");
+    let code_path = std::env::temp_dir().join("argospass-test-cli-export-file.code");
+
+    // As with `pepper export > code.txt`, under two different umasks.
+    for (mode, warned) in [(0o644, true), (0o600, false)] {
+        let _ = fs::remove_file(&code_path);
+        let file = fs::File::create(&code_path).expect("create should succeed");
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .expect("chmod should succeed");
+
+        let export = cli(&path, &pepper_path, &["pepper", "export"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(file))
+            .stderr(Stdio::piped())
+            .output()
+            .expect("the binary should run");
+        assert!(export.status.success());
+        let stderr = String::from_utf8(export.stderr).expect("UTF-8 output");
+        assert_eq!(stderr.contains("accessible to other users"), warned);
+        let written = fs::read(&code_path).expect("read should succeed");
+        assert!(written == format!("{}\n", *pepper.to_recovery_code()).into_bytes());
+    }
+
+    fs::remove_file(&code_path).expect("cleanup should succeed");
+    fs::remove_file(&pepper_path).expect("cleanup should succeed");
 }

@@ -3,8 +3,7 @@
 use crate::crypto::KdfParams;
 use crate::format::{FORMAT_VERSION, OLDEST_SUPPORTED_VERSION};
 use crate::generator::MIN_LENGTH;
-use crate::pepper::{PEPPER_ID_LEN, PEPPER_LEN};
-use crate::to_hex;
+use crate::pepper::{PEPPER_ID_LEN, PEPPER_LEN, short_id};
 use std::io;
 use std::path::PathBuf;
 
@@ -70,6 +69,24 @@ pub enum Error {
     #[error("this vault needs its pepper file")]
     PepperRequired,
 
+    /// Another pepper file is already where a pepper is being installed. It
+    /// is never overwritten.
+    #[error(
+        "another pepper ({}) is already installed at {}",
+        short_id(existing),
+        .path.display()
+    )]
+    DifferentPepperExists {
+        path: PathBuf,
+        existing: [u8; PEPPER_ID_LEN],
+    },
+
+    /// A pepper recovery code could not be decoded. The reason is a fixed
+    /// text (`&'static str`): no part of the code, which is the pepper, can
+    /// end up in the message.
+    #[error("invalid recovery code: {0}")]
+    InvalidRecoveryCode(&'static str),
+
     /// Encryption failed (only possible for absurdly large vaults).
     #[error("encryption failed")]
     EncryptionFailed,
@@ -104,11 +121,6 @@ pub enum Error {
 
 /// Result type of the ArgosPass library.
 pub type Result<T> = std::result::Result<T, Error>;
-
-/// Shortens a (public) pepper id for messages: its first 4 bytes in hex.
-fn short_id(id: &[u8; PEPPER_ID_LEN]) -> String {
-    to_hex(&id[..4])
-}
 
 // Written by hand: `#[from]` would also expose the JSON error as `source`.
 impl From<serde_json::Error> for Error {

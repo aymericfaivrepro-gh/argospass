@@ -1,10 +1,12 @@
 use argospass::crypto::VaultKey;
 use argospass::generator::{self, generate_password};
-use argospass::pepper::Pepper;
-use argospass::{Entry, Error, Vault, create_private_dir, requires_existing_pepper};
+use argospass::pepper::{Installed, PEPPER_ID_LEN, Pepper, recovery_code_is_complete, short_id};
+use argospass::{
+    Entry, Error, Vault, create_private_dir, requires_existing_pepper, vault_pepper_id,
+};
 use clap::{Parser, Subcommand};
 use log::{LevelFilter, debug, info};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -21,6 +23,11 @@ const CLIPBOARD_TIMEOUT_SECS: u64 = 20;
 /// Number of master password attempts before giving up.
 const MAX_PASSWORD_ATTEMPTS: u32 = 3;
 
+/// Largest input accepted from stdin by `pepper import`: far more than a
+/// recovery code (99 characters) needs, whatever spaces or line breaks
+/// surround it.
+const MAX_RECOVERY_INPUT: usize = 4096;
+
 // Exit codes, so that scripts can tell failures apart.
 const EXIT_FAILURE: u8 = 1;
 /// Also returned by clap itself for invalid arguments.
@@ -31,6 +38,7 @@ const EXIT_IO: u8 = 5;
 const EXIT_ENTRY_NOT_FOUND: u8 = 6;
 const EXIT_ENTRY_EXISTS: u8 = 7;
 const EXIT_PEPPER: u8 = 8;
+const EXIT_RECOVERY_CODE: u8 = 9;
 
 const EXIT_STATUS_HELP: &str = "\
 Exit status:
@@ -42,7 +50,8 @@ Exit status:
   5  input/output error
   6  no entry with this title
   7  an entry with this title already exists
-  8  pepper file missing, invalid, or not the one of this vault";
+  8  pepper file missing, invalid, not the one of this vault, or in the way of an import
+  9  invalid pepper recovery code";
 
 /// ArgosPass: a command-line password manager.
 #[derive(Parser)]
@@ -110,6 +119,36 @@ enum Command {
         #[arg(long)]
         rotate_key: bool,
     },
+    /// Check, back up or restore the pepper file (no master password needed)
+    ///
+    /// Every vault created since format v3 needs the pepper file, in addition to
+    /// the master password. `export` prints the pepper as a recovery code to
+    /// write down, and `import` rebuilds the pepper file from that code: after
+    /// losing it, or on a second computer.
+    Pepper {
+        #[command(subcommand)]
+        command: PepperCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PepperCommand {
+    /// Show the pepper file, its id, and whether it matches the vault
+    Status,
+    /// Print the pepper as a recovery code, to write down or move to another computer
+    ///
+    /// The code is printed on stdout and IS the pepper: keep it on paper or
+    /// offline media, apart from the vault, never in a cloud drive, an e-mail,
+    /// a chat or a screenshot.
+    Export,
+    /// Rebuild the pepper file from its recovery code
+    ///
+    /// The code is read from stdin when it is redirected
+    /// (`argospass pepper import < code.txt`), and otherwise typed or pasted
+    /// with hidden input: a code on several lines is read until it is complete,
+    /// or until an empty line. Spaces, line breaks and letter case do not
+    /// matter. An existing pepper file is never overwritten.
+    Import,
 }
 
 fn main() -> ExitCode {
@@ -150,6 +189,16 @@ fn hint(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
         Error::InvalidPepper { .. } => Some(
             "this is not an ArgosPass pepper file, or it is damaged: restore it from your backup",
         ),
+        Error::DifferentPepperExists { .. } => Some(
+            "it was not overwritten: the vaults created with it could no longer be opened. \
+             If you really want to replace it, first move it elsewhere yourself (and keep it \
+             until you are sure no vault needs it), or install the new pepper at another \
+             path with --pepper <PATH>",
+        ),
+        Error::InvalidRecoveryCode(_) => Some(
+            "check the code against your copy: it is the line printed by \
+             `argospass pepper export`; spaces, line breaks and letter case do not matter",
+        ),
         _ => None,
     }
 }
@@ -172,7 +221,9 @@ fn exit_code(error: &(dyn std::error::Error + 'static)) -> u8 {
             Error::PepperMissing(_)
             | Error::InvalidPepper { .. }
             | Error::PepperMismatch { .. }
-            | Error::PepperRequired => EXIT_PEPPER,
+            | Error::PepperRequired
+            | Error::DifferentPepperExists { .. } => EXIT_PEPPER,
+            Error::InvalidRecoveryCode(_) => EXIT_RECOVERY_CODE,
             Error::EncryptionFailed | Error::KeyDerivation(_) | Error::Random(_) => EXIT_FAILURE,
         };
     }
@@ -208,6 +259,11 @@ fn run() -> AppResult {
     match cli.command {
         Command::Init => init(&paths),
         Command::Passwd { rotate_key } => change_password(&paths, rotate_key),
+        Command::Pepper { command } => match command {
+            PepperCommand::Status => pepper_status(&paths),
+            PepperCommand::Export => export_pepper(&paths),
+            PepperCommand::Import => import_pepper(&paths),
+        },
         command => execute(&paths, command),
     }
 }
@@ -270,6 +326,8 @@ fn create_pepper(path: &Path) -> AppResult<Pepper> {
          * password. Back it up now, SEPARATELY FROM THE VAULT (for example on a\n\
          * USB key, or in another password manager), and never keep it next to\n\
          * the vault in a synced folder (cloud drive, shared backup).\n\
+         *\n\
+         * To write it down on paper instead: `argospass pepper export`.\n\
          ************************************************************************\n",
         path.display()
     );
@@ -350,6 +408,199 @@ fn require_vault(path: &Path) -> AppResult {
     Ok(())
 }
 
+/// Shows the pepper file, its id, and whether the vault can be opened with it.
+/// Only public data is read and shown: never the pepper, and the vault is not
+/// decrypted.
+fn pepper_status(paths: &Paths) -> AppResult {
+    let pepper_id = match Pepper::load(&paths.pepper) {
+        Ok(pepper) => Some(pepper.id()),
+        Err(Error::PepperMissing(_)) => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    match &pepper_id {
+        Some(id) => {
+            println!("Pepper file: {}", paths.pepper.display());
+            println!("Pepper id:   {}", short_id(id));
+        }
+        None => println!("Pepper file: {} (not found)", paths.pepper.display()),
+    }
+    match vault_status(&paths.vault, pepper_id.as_ref())? {
+        Some(status) => {
+            println!("Vault file:  {}", paths.vault.display());
+            println!("Status:      {status}");
+        }
+        None => println!("Vault file:  {} (not found)", paths.vault.display()),
+    }
+    Ok(())
+}
+
+/// Tells whether the vault at `path` can be opened with the pepper whose id is
+/// `pepper_id` (`None`: there is no pepper file). Returns `None` if there is no
+/// vault. Only the vault header is read.
+fn vault_status(path: &Path, pepper_id: Option<&[u8; PEPPER_ID_LEN]>) -> AppResult<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let status = match (vault_pepper_id(path)?, pepper_id) {
+        (None, _) => "the vault predates the pepper (format v2 or older): \
+                      opening it upgrades it to use the pepper"
+            .to_string(),
+        (Some(expected), Some(found)) if expected == *found => {
+            "the pepper matches this vault".to_string()
+        }
+        (Some(expected), Some(_)) => format!(
+            "the pepper does NOT match this vault, which needs pepper {}",
+            short_id(&expected)
+        ),
+        (Some(expected), None) => format!(
+            "this vault needs pepper {}, and there is no pepper file",
+            short_id(&expected)
+        ),
+    };
+    Ok(Some(status))
+}
+
+/// Prints the pepper as a recovery code on stdout, and on stderr what it is
+/// and how to keep it.
+fn export_pepper(paths: &Paths) -> AppResult {
+    let pepper = Pepper::load(&paths.pepper)?;
+    let code = pepper.to_recovery_code();
+
+    eprintln!(
+        "\n\
+         ************************************************************************\n\
+         * Recovery code of the pepper {} ({}).\n\
+         *\n\
+         * This code IS THE PEPPER: with it and a copy of the vault, only the\n\
+         * master password protects your entries. Keep it on paper or on\n\
+         * offline media (a USB key), SEPARATELY FROM THE VAULT. Never put it in\n\
+         * a cloud drive (OneDrive...), an e-mail, a chat or a screenshot.\n\
+         ************************************************************************\n",
+        short_id(&pepper.id()),
+        paths.pepper.display()
+    );
+    println!("{}", *code);
+    if io::stdout().is_terminal() {
+        eprintln!(
+            "\nOnce it is copied, run `clear`, so that it does not stay on screen \
+             or in the terminal's scrollback."
+        );
+    } else {
+        eprintln!(
+            "The code was written to a file or a pipe, not to the screen: a file holding it \
+             is as sensitive as the pepper. Delete it once the code is stored safely."
+        );
+        warn_if_stdout_readable_by_others()?;
+    }
+    Ok(())
+}
+
+/// Warns if stdout is a file that other users can access (Unix only): a file
+/// created by `> code.txt` gets the shell's default permissions, often `644`.
+fn warn_if_stdout_readable_by_others() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        // A second handle on stdout, only to read its metadata (`fstat`).
+        let stdout = std::fs::File::from(io::stdout().as_fd().try_clone_to_owned()?);
+        let metadata = stdout.metadata()?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if metadata.is_file() && mode & 0o077 != 0 {
+            eprintln!(
+                "Warning: that file is accessible to other users (mode {mode:o}): \
+                 run `chmod 600` on it."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Rebuilds the pepper file from a recovery code. An existing pepper file is
+/// never overwritten.
+fn import_pepper(paths: &Paths) -> AppResult {
+    let pepper = read_recovery_code()?;
+    let id = pepper.id();
+    match pepper.install(&paths.pepper)? {
+        Installed::Created => println!(
+            "Pepper {} installed at {}",
+            short_id(&id),
+            paths.pepper.display()
+        ),
+        Installed::AlreadyPresent => println!(
+            "Pepper {} is already installed at {}: nothing was written.",
+            short_id(&id),
+            paths.pepper.display()
+        ),
+    }
+    // Only informative: the pepper is installed whatever happens here.
+    match vault_status(&paths.vault, Some(&id)) {
+        Ok(Some(status)) => println!("Vault {}: {status}", paths.vault.display()),
+        Ok(None) => {}
+        Err(error) => eprintln!(
+            "Warning: could not check whether the vault {} matches: {error}",
+            paths.vault.display()
+        ),
+    }
+    Ok(())
+}
+
+/// Reads a recovery code and decodes it: typed with hidden input on a
+/// terminal, or read from stdin when it is redirected. Our copies of the input
+/// are wiped once decoded.
+fn read_recovery_code() -> AppResult<Pepper> {
+    if io::stdin().is_terminal() {
+        return read_typed_recovery_code();
+    }
+
+    // Sized up front so that it never grows: growing would leave unwiped
+    // copies of the code behind. One byte more than accepted tells a longer
+    // input apart.
+    let mut input = Zeroizing::new(Vec::with_capacity(MAX_RECOVERY_INPUT + 1));
+    io::stdin()
+        .lock()
+        .take(MAX_RECOVERY_INPUT as u64 + 1)
+        .read_to_end(&mut input)?;
+    if input.len() > MAX_RECOVERY_INPUT {
+        return Err(Error::InvalidRecoveryCode("the input is too long").into());
+    }
+    // Borrowed, not copied: `from_utf8` only checks the bytes.
+    let code = std::str::from_utf8(&input)
+        .map_err(|_| Error::InvalidRecoveryCode("the input is not valid UTF-8 text"))?;
+    Ok(Pepper::from_recovery_code(code)?)
+}
+
+/// Reads a recovery code typed or pasted on the terminal, with hidden input.
+///
+/// Each prompt reads a single line, but a code pasted over several lines
+/// arrives all at once: lines are read until the code is complete, or until an
+/// empty line. A line left unread would go to the shell once ArgosPass exits,
+/// and the shell would show it and save it in its history.
+fn read_typed_recovery_code() -> AppResult<Pepper> {
+    // Sized up front: growing would leave unwiped copies of the code behind.
+    // (rpassword's own buffer for each line still grows: see the README.)
+    let mut code = Zeroizing::new(String::with_capacity(MAX_RECOVERY_INPUT));
+    let mut prompt = "Recovery code: ";
+    loop {
+        let line = Zeroizing::new(rpassword::prompt_password(prompt)?);
+        if line.trim().is_empty() {
+            break;
+        }
+        if code.len() + line.len() + 1 > code.capacity() {
+            return Err(Error::InvalidRecoveryCode("the input is too long").into());
+        }
+        code.push_str(&line);
+        code.push('\n');
+        if recovery_code_is_complete(&code) {
+            break;
+        }
+        prompt = "Rest of the code (or an empty line to stop): ";
+    }
+    Ok(Pepper::from_recovery_code(&code)?)
+}
+
 /// Unlocks the vault with the master password, then runs the command.
 fn execute(paths: &Paths, command: Command) -> AppResult {
     let path = paths.vault.as_path();
@@ -358,7 +609,10 @@ fn execute(paths: &Paths, command: Command) -> AppResult {
     let (mut vault, key) = unlock(path, &pepper)?;
 
     match command {
-        Command::Init | Command::Generate { .. } | Command::Passwd { .. } => {
+        Command::Init
+        | Command::Generate { .. }
+        | Command::Passwd { .. }
+        | Command::Pepper { .. } => {
             unreachable!("handled in run()")
         }
         Command::Add {

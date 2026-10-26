@@ -10,7 +10,7 @@ pub use error::{Error, Result};
 use crypto::{ENVELOPE_LEN, KdfParams, NONCE_LEN, SALT_LEN, TAG_LEN, VaultKey};
 use format::{FORMAT_VERSION, HEADER_LEN, Header, MAGIC};
 use log::{debug, info, warn};
-use pepper::Pepper;
+use pepper::{PEPPER_ID_LEN, Pepper};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -279,11 +279,33 @@ impl Vault {
 /// opened, so a missing pepper file may be created for them. Only the start of
 /// the file is read, and nothing is authenticated yet.
 pub fn requires_existing_pepper(path: &Path) -> Result<bool> {
+    Ok(format::needs_pepper(&read_header_bytes(path)?))
+}
+
+/// Returns the id of the pepper the vault at `path` was created with, or
+/// `None` for a vault in a format older than v3 (which has no pepper yet).
+///
+/// Only the header is read and validated, as [`Vault::open`] does before any
+/// key derivation: nothing is decrypted, so no password is needed. The id is
+/// not authenticated yet: a tampered id is only detected when the vault is
+/// opened.
+pub fn vault_pepper_id(path: &Path) -> Result<Option<[u8; PEPPER_ID_LEN]>> {
+    let start = read_header_bytes(path)?;
+    if !start.starts_with(MAGIC) {
+        // The legacy layout has no header (and no pepper).
+        return Ok(None);
+    }
+    Ok(Header::from_bytes(&start)?.pepper_id())
+}
+
+/// Reads the first bytes of the file at `path`, up to the length of a header
+/// in the current format.
+fn read_header_bytes(path: &Path) -> Result<Vec<u8>> {
     let mut start = Vec::with_capacity(HEADER_LEN);
     fs::File::open(path)?
         .take(HEADER_LEN as u64)
         .read_to_end(&mut start)?;
-    Ok(format::needs_pepper(&start))
+    Ok(start)
 }
 
 /// Creates `dir` and its parents if needed.

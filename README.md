@@ -38,6 +38,9 @@ argospass get GitHub --show                           # print the password in th
 argospass remove GitHub                               # remove an entry
 argospass generate                                    # print a random password (no vault needed)
 argospass passwd                                      # change the master password
+argospass pepper status                               # show the pepper file and whether it matches the vault
+argospass pepper export                               # print the pepper's recovery code, to write down
+argospass pepper import                               # rebuild the pepper file from its recovery code
 argospass --help                                      # full help (also: argospass <command> --help)
 ```
 
@@ -52,6 +55,9 @@ argospass --help                                      # full help (also: argospa
 | `remove <TITLE>` | Delete an entry | Yes |
 | `generate` | Print a random password: 24 characters by default (minimum 8), symbols included unless `--no-symbols` is given | No |
 | `passwd [--rotate-key]` | Change the master password. `--rotate-key` also generates a new data key. Without `--rotate-key`, the new password must differ from the current one. See [Changing the master password](#changing-the-master-password). | Yes, then chooses the new one |
+| `pepper status` | Show the pepper file, its id, and whether it matches the vault. See [Pepper recovery code](#pepper-recovery-code). | No |
+| `pepper export` | Print the pepper as a recovery code, to write down or move to another computer | No |
+| `pepper import` | Rebuild the pepper file from its recovery code, read from stdin or typed with hidden input. Never overwrites an existing pepper file. | No |
 
 You get **3 attempts** to type the master password.
 
@@ -91,9 +97,49 @@ Earlier versions of ArgosPass named the backup of a vault whose name does not en
 The pepper is a file of 32 random bytes, kept **outside the vault**. ArgosPass needs it, in addition to the master password, to open any vault created since format v3. See [What the pepper adds](#what-the-pepper-adds) for what it protects against.
 
 - `init` creates it if it does not exist yet, and otherwise reuses it: several vaults can share one pepper. Opening a vault in an older format also creates it if needed, then upgrades the vault to use it. ArgosPass then prints a large warning with its path.
-- **Without the pepper file, the vault cannot be opened, even with the right master password.** There is no recovery. Back it up right after it is created, **separately from the vault** (for example on a USB key, or in another password manager), and never keep it next to the vault in a synced folder.
+- **Without the pepper file, the vault cannot be opened, even with the right master password.** Nothing can rebuild it except your own backup. Back it up right after it is created, **separately from the vault** (for example on a USB key, in another password manager, or as a [recovery code](#pepper-recovery-code) written on paper), and never keep it next to the vault in a synced folder.
 - An existing pepper file is never overwritten. On Unix, it is created with `600` permissions (and a warning is shown if other users can access it).
-- If the pepper file is missing, damaged, or not the one the vault was created with, ArgosPass stops before any key derivation and exits with code `8`, with a hint. Point it to the right file with `--pepper <PATH>`.
+- If the pepper file is missing, damaged, or not the one the vault was created with, ArgosPass stops before any key derivation and exits with code `8`, with a hint. Point it to the right file with `--pepper <PATH>`, or rebuild it from its recovery code with `pepper import`.
+
+### Pepper recovery code
+
+`argospass pepper export` prints the pepper as a **recovery code**: one line of 99 characters, short enough to write down by hand.
+
+```
+ARGOS-PEPPER-1-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-cccc
+```
+
+- `ARGOS-PEPPER-1` is a fixed prefix. The `1` is the version of the code format.
+- The 16 `xxxx` groups are the 32 bytes of the pepper, in lowercase hexadecimal.
+- `cccc` is a check group: the first 2 bytes of the [pepper id](#what-the-pepper-adds). A typo gives another pepper, whose id almost never starts with these 2 bytes, so `pepper import` refuses the code instead of installing a wrong pepper. About 1 typo in 65,536 still gets through: the pepper installed then does not match the vault, and `pepper import` and `pepper status` say so.
+
+**The recovery code is the pepper.** Whoever reads it can rebuild the pepper file. Keep it like the pepper file:
+
+- on paper in a safe place, or on offline media such as a USB key, **separately from the vault**;
+- **never** in a cloud drive (OneDrive, Google Drive, Dropbox…), an e-mail, a chat, a synced notes app, a screenshot or a photo.
+
+The code goes to stdout and the explanations to stderr. Run `clear` once you have copied it, so that it does not stay on screen or in the terminal's scrollback. A file you redirect it to is as sensitive as the pepper. The shell creates it with its default permissions, often readable by every user (`644`), so create it readable by you only, `(umask 077; argospass pepper export > code.txt)`, and delete it once the code is stored safely. On Unix, ArgosPass warns if the file is accessible to other users.
+
+`argospass pepper import` rebuilds the pepper file from the code:
+
+- The code is read from stdin if it is redirected (`argospass pepper import < code.txt`), and is otherwise typed or pasted with hidden input. A code on several lines is read until it is complete, or until an empty line: every pasted line is read by ArgosPass, none is left for the shell (which would show it and keep it in its history).
+- Letter case, spaces, tabs, line breaks and extra `-` do not matter. A code with a wrong prefix, a wrong number of digits, a character that is not a hex digit, or a check group that does not match is refused with exit code `9`. The error says which, never what the code contains.
+- If there is no pepper file, it is created (`600` on Unix), and its id is printed.
+- If the same pepper is already installed, nothing is written and the command succeeds.
+- If **another** pepper file is already there (or a file that is not a pepper), the import is refused with exit code `8`, and the file is left untouched: overwriting it could make the vaults created with it unreadable. If you really mean to replace it, move it elsewhere yourself first, and keep it until you are sure no vault needs it.
+- If the vault exists, the command then tells whether the pepper matches it. This check is only informative: if the vault cannot be read, a warning is shown, and the import still succeeds.
+
+`argospass pepper status` shows the path of the pepper file, whether it exists, its id (first 4 bytes), and, if the vault exists, whether the pepper matches it or the vault predates the pepper. It never shows the pepper, and does not decrypt the vault: it only reads the pepper id from the vault header.
+
+The `pepper` commands do not ask for the master password. It would protect nothing: the pepper file is not encrypted, so anyone who can run ArgosPass under your account can read it anyway.
+
+### Using a second computer
+
+1. On the first computer, run `argospass pepper export`, and copy the code by hand, on paper. Or write it to a USB key: `(umask 077; argospass pepper export > /media/usb/pepper-code.txt)`.
+2. On the second computer, run `argospass pepper import` and type the code, or run `argospass pepper import < /media/usb/pepper-code.txt`. Then delete the file from the USB key, unless that key is your offline backup.
+3. Put the vault on the second computer, then run `argospass pepper status`. It should say `the pepper matches this vault`.
+
+Never send the code or the pepper file through the cloud, e-mail or a chat, even to yourself. The pepper protects you only as long as it stays out of the places where the vault goes.
 
 ### Exit codes
 
@@ -107,7 +153,8 @@ The pepper is a file of 32 random bytes, kept **outside the vault**. ArgosPass n
 | `5` | Input/output error |
 | `6` | No entry with this title |
 | `7` | An entry with this title already exists |
-| `8` | Pepper file missing, invalid, or not the one this vault was created with |
+| `8` | Pepper file missing, invalid, or not the one this vault was created with. For `pepper import`: another pepper file is already there |
+| `9` | Invalid pepper recovery code (`pepper import`) |
 
 ## Security model
 
@@ -131,7 +178,7 @@ The pepper is a 256-bit random secret, stored in its own file and never in the v
 - **It protects against the theft or leak of the vault file alone** (cloud copy, backup, a USB key holding only the vault). To test a single password guess, an attacker would also need the 256 random bits of the pepper: guessing becomes hopeless, even for a weak master password.
 - **It does not help** if the attacker gets both files: from a synced folder or a backup holding both, or from the machine itself. Then only the master password and Argon2id protect the vault, as before the pepper.
 - **It does not protect copies made before the pepper existed** (format v2 and older: old backups, cloud history). They still open with the master password alone.
-- **Losing it means losing the vault.** Back it up separately from the vault (see [Pepper file](#pepper-file)).
+- **Losing it means losing the vault.** Back it up separately from the vault, for example as a [recovery code](#pepper-recovery-code) on paper (see [Pepper file](#pepper-file)).
 
 The vault header stores a pepper **id**: the first 16 bytes of SHA-256(`"ArgosPass pepper id v1"` ‖ pepper). It is public and reveals nothing usable about the pepper, but it lets ArgosPass tell a wrong pepper file from a wrong password, before any key derivation.
 
@@ -320,7 +367,8 @@ When freed, memory is not erased: secrets could remain in RAM, then end up in a 
 | --- | --- |
 | Key-encryption key (KEK) | `Box<Zeroizing<[u8; 32]>>`: stored once on the heap (never copied around the stack). Wiped right after opening (or creating) the envelope, so it is never kept while the vault is open |
 | Data key | `Box<Zeroizing<[u8; 32]>>`: drawn at random directly into a zeroed heap buffer, or decrypted into a `Zeroizing<Vec<u8>>` and copied into one, so it never touches the stack. Kept while the command runs (saving needs it) and wiped on drop |
-| Pepper | `Box<Zeroizing<[u8; 32]>>`: drawn at random, or read from its file, directly into a zeroed heap buffer. Kept while the command runs (opening and `passwd` need it) and wiped on drop |
+| Pepper | `Box<Zeroizing<[u8; 32]>>`: drawn at random, read from its file, or decoded from its recovery code, directly into a zeroed heap buffer. Kept while the command runs (opening and `passwd` need it) and wiped on drop |
+| Recovery code | `pepper export` builds it in a `Zeroizing<String>` of exactly its size. `pepper import` reads it into a pre-sized `Zeroizing<Vec<u8>>` (stdin) or `Zeroizing<String>` (typed, but see [Known limitations](#known-limitations)), then decodes it character by character straight into the pepper's buffer, with no copy of its own |
 | Keys of the old formats (v2, v1, legacy) | Wiped right after decrypting the old file, before the upgrade |
 | Key copy inside the cipher | Each XChaCha20-Poly1305 instance keeps its own copy of the key. It only lives for one encryption or decryption, and the `chacha20poly1305` crate wipes it on drop |
 | Argon2 working memory (128 MiB by default) | Allocated by ArgosPass in a `Zeroizing` buffer and wiped after the derivation. The `argon2` crate would otherwise free it without wiping it. |
@@ -332,7 +380,9 @@ When freed, memory is not erased: secrets could remain in RAM, then end up in a 
 ## Known limitations
 
 - **Swap:** memory pages are not locked (`mlock`), so the operating system could write a secret to swap before it is wiped.
-- **Copies outside ArgosPass:** the terminal (with `--show`), the clipboard, and especially **clipboard history** tools (`Win + V` on Windows, clipboard managers on Linux) may keep a copy that ArgosPass cannot erase.
+- **Copies outside ArgosPass:** the terminal (with `--show`, and the recovery code printed by `pepper export`), the clipboard, and especially **clipboard history** tools (`Win + V` on Windows, clipboard managers on Linux) may keep a copy that ArgosPass cannot erase.
+- **Typed secrets:** `rpassword`, which reads hidden input, grows its buffer one character at a time, and each reallocation leaves the previous, unwiped copy in freed memory. A master password, or a recovery code typed or pasted on the terminal, may therefore leave partial copies behind. A recovery code read from stdin does not.
+- **Standard input and output buffers:** the Rust standard library keeps what goes through stdin and stdout in buffers that ArgosPass cannot wipe. A recovery code read from stdin, and a password or recovery code printed by `generate`, `get --show` or `pepper export`, stay there until the command exits.
 - **Ctrl+C during `get`:** interrupting the 20-second countdown leaves the password in the clipboard.
 - **Whole vault decrypted at once:** every entry is in clear in memory while a command runs, not only the one you asked for.
 - **No rollback protection** and **file size not hidden** (see [Security model](#security-model)).
@@ -359,7 +409,7 @@ src/
 ├── lib.rs         Entry, Vault, open/save, atomic writes
 ├── crypto.rs      Argon2id derivation, envelope encryption (KEK, data key), XChaCha20-Poly1305, KdfParams, VaultKey
 ├── format.rs      vault header: serialization, parsing, validation, format versions
-├── pepper.rs      pepper file: generation, creation, loading, id
+├── pepper.rs      pepper file: generation, creation, loading, id, recovery code, import
 ├── generator.rs   password generator
 └── error.rs       error type
 tests/
@@ -379,7 +429,13 @@ Unit tests live next to the code they test. Integration tests in `tests/vault.rs
 - a wrong pepper is rejected before any key derivation, and a wrong password with the right pepper as before;
 - a modified header, pepper id or envelope is rejected;
 - v2, v1 and legacy vaults are upgraded to v3, their backup included, and then only open with the pepper;
-- after a password change (with or without `--rotate-key`), the vault and its backup open with the new password only, and the backup keeps `600` permissions.
+- after a password change (with or without `--rotate-key`), the vault and its backup open with the new password only, and the backup keeps `600` permissions;
+- a lost pepper file is rebuilt from its recovery code, and the vault opens again;
+- importing a pepper never overwrites another pepper file (left byte for byte identical), and importing the installed pepper writes nothing;
+- the pepper id of a vault is read from its header alone, and is absent before format v3;
+- through the binary: `pepper status`, `pepper export` (the code on stdout only, never on stderr, with a warning if the file it goes to is accessible to other users), and `pepper import` from stdin, which rejects a code with a typo (exit code `9`) and never replaces another pepper (exit code `8`).
+
+The unit tests of `pepper.rs` also check the recovery code: its exact layout, that letter case, spaces and line breaks are tolerated, that a wrong prefix, a wrong length, a character that is not a hex digit, and every single-digit typo or swap of two neighbouring digits (for a fixed pepper) are rejected, and that a code typed over several lines is complete only with its last line.
 
 Each test uses its own temporary pepper file. During development, always use a test vault and a test pepper (`--vault /tmp/... --pepper /tmp/...`), never your real ones. Vault and pepper files (`*.argos`, `*.argos.*`, `*.key`) are ignored by Git.
 
