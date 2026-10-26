@@ -338,16 +338,36 @@ fn create_pepper(path: &Path) -> AppResult<Pepper> {
 ///
 /// If the pepper file is missing, it is only created for a vault in an older
 /// format, which is then upgraded to use it. A vault that already uses a
-/// pepper can only be opened with its own.
+/// pepper can only be opened with its own: this is checked here, before the
+/// master password is asked for.
 fn pepper_for_vault(paths: &Paths) -> AppResult<Pepper> {
-    match Pepper::load(&paths.pepper) {
-        Ok(pepper) => Ok(pepper),
+    let pepper = match Pepper::load(&paths.pepper) {
+        Ok(pepper) => pepper,
         Err(Error::PepperMissing(_)) if !requires_existing_pepper(&paths.vault)? => {
             info!("the vault predates peppers: creating one for its upgrade");
-            create_pepper(&paths.pepper)
+            return create_pepper(&paths.pepper);
         }
-        Err(error) => Err(error.into()),
+        Err(error) => return Err(error.into()),
+    };
+    check_pepper(&paths.vault, &pepper)?;
+    Ok(pepper)
+}
+
+/// Fails with [`Error::PepperMismatch`] if the vault at `path` was created
+/// with another pepper. A vault older than format v3 has no pepper to check.
+///
+/// Only the header is read, so a wrong pepper is reported without asking for
+/// a master password that could not open the vault anyway. The id read here
+/// is not authenticated yet, and the file may change before it is opened:
+/// [`Vault::open`] checks it again, and the envelope's tag covers it.
+fn check_pepper(path: &Path, pepper: &Pepper) -> AppResult {
+    if let Some(expected) = vault_pepper_id(path)? {
+        let found = pepper.id();
+        if found != expected {
+            return Err(Error::PepperMismatch { expected, found }.into());
+        }
     }
+    Ok(())
 }
 
 /// Changes the master password. With `rotate_key`, also replaces the data key.

@@ -164,18 +164,6 @@ impl Header {
     }
 }
 
-/// Tells whether `start`, the first bytes of a vault file, belongs to a vault
-/// whose key derivation needs a pepper (format v3 and later).
-///
-/// Nothing is authenticated or validated: only for choosing what to do when
-/// the pepper file is missing.
-pub(crate) fn needs_pepper(start: &[u8]) -> bool {
-    start.starts_with(MAGIC)
-        && start
-            .get(VERSION_OFFSET)
-            .is_some_and(|&version| version >= FIRST_PEPPER_VERSION)
-}
-
 /// Reads a little-endian `u32` at `offset`. The caller guarantees the bounds.
 fn read_u32(data: &[u8], offset: usize) -> u32 {
     let bytes: [u8; 4] = data[offset..offset + 4]
@@ -293,14 +281,5 @@ mod tests {
                 Err(Error::UnsupportedKdfParams(params)) if params == header.params
             ));
         }
-    }
-
-    #[test]
-    fn needs_pepper_from_v3_on() {
-        assert!(needs_pepper(&sample_header().to_bytes()));
-        assert!(!needs_pepper(&sample_v2_bytes(2)));
-        assert!(!needs_pepper(&sample_v2_bytes(1)));
-        // Legacy layout: no magic number.
-        assert!(!needs_pepper(&[0u8; 64]));
     }
 }

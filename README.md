@@ -99,7 +99,7 @@ The pepper is a file of 32 random bytes, kept **outside the vault**. ArgosPass n
 - `init` creates it if it does not exist yet, and otherwise reuses it: several vaults can share one pepper. Opening a vault in an older format also creates it if needed, then upgrades the vault to use it. ArgosPass then prints a large warning with its path.
 - **Without the pepper file, the vault cannot be opened, even with the right master password.** Nothing can rebuild it except your own backup. Back it up right after it is created, **separately from the vault** (for example on a USB key, in another password manager, or as a [recovery code](#pepper-recovery-code) written on paper), and never keep it next to the vault in a synced folder.
 - An existing pepper file is never overwritten. On Unix, it is created with `600` permissions (and a warning is shown if other users can access it).
-- If the pepper file is missing, damaged, or not the one the vault was created with, ArgosPass stops before any key derivation and exits with code `8`, with a hint. Point it to the right file with `--pepper <PATH>`, or rebuild it from its recovery code with `pepper import`.
+- If the pepper file is missing, damaged, or not the one the vault was created with, opening the vault stops before the master password is asked for (and before any key derivation) and exits with code `8`, with a hint. (`init` asks for the new master password first: a damaged pepper file is only reported after it.) Point it to the right file with `--pepper <PATH>`, or rebuild it from its recovery code with `pepper import`.
 
 ### Pepper recovery code
 
@@ -232,7 +232,7 @@ payload ─────────────────► XChaCha20-Poly130
 ```
 
 1. ArgosPass reads the header and checks the magic bytes, the format version, the Argon2 parameters and the file length, all before any key derivation.
-2. It also checks that the pepper id in the header is the id of the pepper file, still before any derivation. Otherwise it stops: wrong or missing pepper (exit code `8`).
+2. It also checks that the pepper id in the header is the id of the pepper file, still before any derivation. Otherwise it stops: wrong or missing pepper (exit code `8`). The command line already does this check from the header alone before asking for the master password; it is done again here because the id is only authenticated by the envelope's tag, and the file may have changed in between.
 3. The master password, the pepper and the salt go through Argon2id with the parameters from the header. The output is the KEK.
 4. The KEK opens the envelope: XChaCha20-Poly1305 checks the envelope's tag over the encrypted data key **and the header**, then decrypts the data key. The KEK is wiped right away.
 5. The data key decrypts the payload. Its tag covers the ciphertext **and everything before it** (header and envelope).
@@ -427,12 +427,14 @@ Unit tests live next to the code they test. Integration tests in `tests/vault.rs
 - the file has `600` permissions (Unix only);
 - new vaults use format v3 (176 bytes when empty), with the pepper id at offset 34;
 - a wrong pepper is rejected before any key derivation, and a wrong password with the right pepper as before;
+- through the binary, a wrong pepper is rejected (exit code `8`) before the master password is asked for, by `list` and `passwd`;
 - a modified header, pepper id or envelope is rejected;
 - v2, v1 and legacy vaults are upgraded to v3, their backup included, and then only open with the pepper;
 - after a password change (with or without `--rotate-key`), the vault and its backup open with the new password only, and the backup keeps `600` permissions;
 - a lost pepper file is rebuilt from its recovery code, and the vault opens again;
 - importing a pepper never overwrites another pepper file (left byte for byte identical), and importing the installed pepper writes nothing;
 - the pepper id of a vault is read from its header alone, and is absent before format v3;
+- a vault in a newer format is reported as unsupported (exit code `4`), not as missing its pepper, and no pepper file is created for it;
 - through the binary: `pepper status`, `pepper export` (the code on stdout only, never on stderr, with a warning if the file it goes to is accessible to other users), and `pepper import` from stdin, which rejects a code with a typo (exit code `9`) and never replaces another pepper (exit code `8`).
 
 The unit tests of `pepper.rs` also check the recovery code: its exact layout, that letter case, spaces and line breaks are tolerated, that a wrong prefix, a wrong length, a character that is not a hex digit, and every single-digit typo or swap of two neighbouring digits (for a fixed pepper) are rejected, and that a code typed over several lines is complete only with its last line.

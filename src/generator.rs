@@ -102,7 +102,7 @@ mod tests {
     fn two_passwords_differ() {
         let a = generate_password(DEFAULT_LENGTH, true).expect("generation should succeed");
         let b = generate_password(DEFAULT_LENGTH, true).expect("generation should succeed");
-        assert_ne!(a, b);
+        assert!(a != b);
     }
 
     #[test]

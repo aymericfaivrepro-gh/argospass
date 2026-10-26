@@ -50,7 +50,7 @@ fn saves_then_opens_encrypted_vault() {
 
     let (opened, _) = Vault::open(&path, "master", &pepper).expect("open should succeed");
     let entry = opened.get("Gmail").expect("entry should exist");
-    assert_eq!(entry.password, "secret");
+    assert!(entry.password == "secret");
 
     fs::remove_file(&path).expect("cleanup should succeed");
 }
@@ -417,7 +417,7 @@ fn v2_vault_is_upgraded_to_v3() {
 
     let (vault, _) = Vault::open(&path, "master", &pepper).expect("v2 vault should open");
     let entry = vault.get("Gmail").expect("entry should exist");
-    assert_eq!(entry.password, "secret");
+    assert!(entry.password == "secret");
 
     // No copy without the pepper is left: the backup was replaced too.
     assert_upgraded_to_v3(&path, &backup, &pepper, &other);
@@ -457,7 +457,7 @@ fn password_change() {
     let (opened, _) =
         Vault::open(&path, "new password", &pepper).expect("new password should open");
     let entry = opened.get("Gmail").expect("entry should exist");
-    assert_eq!(entry.password, "secret");
+    assert!(entry.password == "secret");
     assert!(matches!(
         Vault::open(&path, "old password", &pepper),
         Err(Error::DecryptionFailed)
@@ -503,7 +503,7 @@ fn password_change_with_key_rotation() {
         let (opened, _) =
             Vault::open(file, "new password", &pepper).expect("new password should open");
         let entry = opened.get("Gmail").expect("entry should exist");
-        assert_eq!(entry.password, "secret");
+        assert!(entry.password == "secret");
         assert!(matches!(
             Vault::open(file, "old password", &pepper),
             Err(Error::DecryptionFailed)
@@ -593,10 +593,8 @@ fn import_never_overwrites_another_pepper() {
         other.install(&pepper_path),
         Err(Error::InvalidPepper { .. })
     ));
-    assert_eq!(
-        fs::read(&pepper_path).expect("read should succeed"),
-        b"not a pepper"
-    );
+    // Also `assert!`: after a failed check, the file would hold a pepper.
+    assert!(fs::read(&pepper_path).expect("read should succeed") == b"not a pepper");
 
     fs::remove_file(&pepper_path).expect("cleanup should succeed");
 }
@@ -795,6 +793,58 @@ fn cli_rejects_a_recovery_code_with_a_typo() {
     assert!(fs::read(&pepper_path).expect("read should succeed") == before);
 
     fs::remove_file(&pepper_path).expect("cleanup should succeed");
+}
+
+#[test]
+fn cli_rejects_a_wrong_pepper_before_asking_for_the_password() {
+    let path = temp_vault("cli-wrong-pepper");
+    let pepper = temp_pepper("cli-wrong-pepper");
+    let other_path = temp_pepper_path("cli-wrong-pepper-other");
+    let other = Pepper::create(&other_path).expect("pepper creation should succeed");
+    let key = VaultKey::new("master", &pepper).expect("key derivation should succeed");
+    Vault::new().save(&path, &key).expect("save should succeed");
+    let before = fs::read(&path).expect("read should succeed");
+
+    // The password is read from the terminal, not from stdin. Without one (as
+    // in CI), asking for it would fail with an I/O error (exit code 5) instead.
+    // Only such a run catches a check done too late: on a terminal, the binary
+    // would wait for the password.
+    for args in [&["list"][..], &["passwd"]] {
+        let output = run_cli(&path, &other_path, args, b"");
+        assert_eq!(output.status.code(), Some(8), "{args:?}");
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 output");
+        assert!(stderr.contains("wrong pepper"));
+        assert!(stderr.contains(&short_id(&pepper.id())));
+        assert!(stderr.contains(&short_id(&other.id())));
+    }
+    assert!(fs::read(&path).expect("read should succeed") == before);
+
+    fs::remove_file(&path).expect("cleanup should succeed");
+    fs::remove_file(&other_path).expect("cleanup should succeed");
+}
+
+#[test]
+fn newer_format_is_unsupported_even_without_a_pepper() {
+    let path = temp_vault("newer-format");
+    let pepper_path = temp_pepper_path("newer-format");
+
+    // The fields of a v3 header, with a version this build does not know.
+    let mut v4 = old_header(4, &[7u8; SALT_LEN]);
+    v4.extend_from_slice(&[9u8; PEPPER_ID_LEN]);
+    assert_eq!(v4.len(), HEADER_LEN);
+    fs::write(&path, &v4).expect("write should succeed");
+
+    assert!(matches!(
+        requires_existing_pepper(&path),
+        Err(Error::UnsupportedVersion(4))
+    ));
+
+    // Not reported as a missing pepper, and no pepper is created for it.
+    let output = run_cli(&path, &pepper_path, &["list"], b"");
+    assert_eq!(output.status.code(), Some(4));
+    assert!(!pepper_path.exists());
+
+    fs::remove_file(&path).expect("cleanup should succeed");
 }
 
 #[cfg(unix)]

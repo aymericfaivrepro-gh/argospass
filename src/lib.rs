@@ -276,10 +276,12 @@ impl Vault {
 /// pepper (format v3 and later).
 ///
 /// Older formats return `false`: they are upgraded with the pepper when
-/// opened, so a missing pepper file may be created for them. Only the start of
-/// the file is read, and nothing is authenticated yet.
+/// opened, so a missing pepper file may be created for them. The header is
+/// validated as by [`vault_pepper_id`]: a vault in a newer format, or with an
+/// invalid header, is an error, so that no pepper is created for it. Nothing is
+/// authenticated yet.
 pub fn requires_existing_pepper(path: &Path) -> Result<bool> {
-    Ok(format::needs_pepper(&read_header_bytes(path)?))
+    Ok(vault_pepper_id(path)?.is_some())
 }
 
 /// Returns the id of the pepper the vault at `path` was created with, or
@@ -402,7 +404,7 @@ mod tests {
         );
         assert_eq!(entry.title, "Gmail");
         assert_eq!(entry.username, "moi@gmail.com");
-        assert_eq!(entry.password, "secret");
+        assert!(entry.password == "secret");
         assert_eq!(entry.url.as_deref(), Some("https://gmail.com"));
     }
     #[test]
@@ -522,9 +524,12 @@ mod tests {
 
         let parsed: Vault = serde_json::from_slice(&json).expect("valid JSON");
         assert_eq!(parsed.list().len(), 50);
-        assert_eq!(
-            parsed.get(&format!("{tricky} 7")).unwrap().password,
-            tricky.repeat(8)
+        assert!(
+            parsed
+                .get(&format!("{tricky} 7"))
+                .expect("entry should exist")
+                .password
+                == tricky.repeat(8)
         );
     }
 }

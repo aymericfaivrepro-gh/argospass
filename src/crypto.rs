@@ -454,7 +454,7 @@ mod tests {
         let key = [42u8; KEY_LEN];
         let encrypted = encrypt(&key, b"hello vault", &[]).expect("encryption should succeed");
         let decrypted = decrypt(&key, &encrypted, &[]).expect("decryption should succeed");
-        assert_eq!(decrypted.as_slice(), b"hello vault");
+        assert!(decrypted.as_slice() == b"hello vault");
     }
 
     #[test]
@@ -575,7 +575,7 @@ mod tests {
 
         let mut key = Zeroizing::new([42u8; KEY_LEN]);
         key.zeroize();
-        assert_eq!(*key, [0u8; KEY_LEN]);
+        assert!(*key == [0u8; KEY_LEN]);
     }
 
     #[test]
